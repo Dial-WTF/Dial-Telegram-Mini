@@ -1,12 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PrivyClient } from '@privy-io/node';
 
 export const runtime = 'nodejs';
 
-const privy = new PrivyClient({
-  appId: process.env.PRIVY_APP_ID as string,
-  appSecret: process.env.PRIVY_APP_SECRET as string,
-});
+// Lazy-initialize Privy client at runtime to avoid build-time dependency
+async function getPrivyClient() {
+  if (!process.env.PRIVY_APP_ID || !process.env.PRIVY_APP_SECRET) return null;
+  try {
+    const mod = await import('@privy-io/node');
+    // @ts-ignore - runtime import
+    const client = new mod.PrivyClient({
+      appId: process.env.PRIVY_APP_ID as string,
+      appSecret: process.env.PRIVY_APP_SECRET as string,
+    });
+    return client;
+  } catch {
+    return null;
+  }
+}
 
 // Minimal webhook endpoint for Telegram bot commands via Bot API webhook
 // Set this path as your webhook URL: <PUBLIC_BASE_URL>/api/bot
@@ -58,6 +68,11 @@ export async function POST(req: NextRequest) {
       }
 
       // Find the Privy user by Telegram user id and get their wallet id
+      const privy = await getPrivyClient();
+      if (!privy) {
+        await reply('Server wallet not configured.');
+        return NextResponse.json({ ok: true });
+      }
       const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
       const wallet = user.linked_accounts.find((a: any) => a.type === 'wallet' && 'id' in a);
       const walletId = (wallet as any)?.id;

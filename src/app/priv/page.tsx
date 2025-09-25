@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo } from "react";
-import WebApp from "@twa-dev/sdk";
 
 /**
  * Dial Mini App — Standard Privacy Policy
@@ -12,31 +11,35 @@ import WebApp from "@twa-dev/sdk";
 export default function Page() {
   // Bind Telegram Mini App behaviors
   useEffect(() => {
-    try {
-      WebApp.ready();
-      WebApp.expand();
+    let unreg: (() => void) | undefined;
+    (async () => {
+      try {
+        const WebApp = (await import("@twa-dev/sdk")).default;
+        WebApp.ready();
+        WebApp.expand();
 
-      // Use the native back button to close the webview
-      WebApp.BackButton.show();
-      const handleBack = () => WebApp.close();
-      WebApp.BackButton.onClick(handleBack);
+        // Use the native back button to close the webview
+        WebApp.BackButton.show();
+        const handleBack = () => WebApp.close();
+        WebApp.BackButton.onClick(handleBack);
+        unreg = () => WebApp.BackButton.offClick(handleBack);
 
-      // Optional: set the header color for better contrast
-      if (WebApp.setHeaderColor) {
-        WebApp.setHeaderColor("secondary_bg_color");
+        // Optional: set the header color for better contrast
+        if (WebApp.setHeaderColor) {
+          WebApp.setHeaderColor("secondary_bg_color");
+        }
+      } catch {
+        // no-op if running outside Telegram
       }
-
-      return () => {
-        WebApp.BackButton.offClick(handleBack);
-      };
-    } catch {
-      // no-op if running outside Telegram
-    }
+    })();
+    return () => {
+      try { unreg && unreg(); } catch {}
+    };
   }, []);
 
   // Theme-aware styles (fallbacks if outside Telegram)
   const theme = useMemo(() => {
-    const p = WebApp?.themeParams ?? {};
+    const p = (typeof window !== 'undefined' && (window as any)?.Telegram?.WebApp?.themeParams) || {};
     return {
       bg: p.bg_color || "#0a0612",
       text: p.text_color || "#EDE9FE",
