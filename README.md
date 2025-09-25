@@ -1,36 +1,68 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+## Dial Pay — Telegram Mini App (TMA)
 
-## Getting Started
+Dial-themed Telegram Mini App to create Request Network invoices with a Cash-App style UI. Runs inside Telegram’s webview, validates Telegram `initData` server-side, optionally uses Privy embedded wallets as payee, creates a Request invoice, and exposes a `/pay/[id]` page with QR + live status polling.
 
-First, run the development server:
+### Tech
+- **Next.js App Router** (Node runtime for API routes)
+- **Telegram SDK**: `@twa-dev/sdk` (dynamic import in client only)
+- **Privy**: `@privy-io/react-auth` (embedded wallets)
+- **Request Network**: `@requestnetwork/request-client.js`
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+### Environment
+Copy `.env.example` → `.env.local` and fill in values:
+
+```
+PUBLIC_BASE_URL=             # e.g. https://your-tunnel.ngrok.app (dev) or prod domain
+REQUEST_NODE_URL=https://main.gateway.request.network
+REQUEST_CHAIN=polygon        # e.g. polygon, base, etc.
+ERC20_TOKEN_ADDRESS=         # optional; if empty uses USDC symbol
+BOT_TOKEN=                   # BotFather token for initData validation
+ALLOW_UNVERIFIED_INITDATA=1  # dev bypass; omit in prod
+PAYEE_ADDR=                  # your org/payee EVM address
+FEE_ADDR=                    # optional; defaults to PAYEE_ADDR
+NEXT_PUBLIC_PRIVY_APP_ID=    # Privy App ID
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### Dev setup
+1) Install deps and run dev server
+```bash
+pnpm install
+pnpm dev
+```
+2) Start a tunnel and set `PUBLIC_BASE_URL` to the HTTPS URL
+```bash
+npx ngrok http 3000
+# or cloudflared tunnel --url http://localhost:3000
+```
+3) Set Telegram bot Web App URL to `PUBLIC_BASE_URL` with BotFather.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### API routes
+- `/api/invoice` (POST)
+  - Validates `initData` unless `ALLOW_UNVERIFIED_INITDATA=1` in non-prod
+  - Creates Request invoice with ERC20 Fee Proxy on the configured chain/token
+  - Responds `{ requestId, payUrl }` where `payUrl = PUBLIC_BASE_URL + /pay/[id]`
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- `/api/status` (GET)
+  - `?id=<requestId>` → rehydrates the request and returns `{ status: 'pending'|'paid', balance }`
 
-## Learn More
+All API routes export `runtime = 'nodejs'` to avoid Edge limitations.
 
-To learn more about Next.js, take a look at the following resources:
+### Client behavior
+- `app/page.tsx` dynamically imports `@twa-dev/sdk` in `useEffect`
+- Privy `ensureWallet()` prompts login if not authenticated, then reads `wallets[0].address`
+- POST to `/api/invoice` with `{ kind, amount:Number, note, initData, payee }`
+- On success, opens `payUrl` inside Telegram webview
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### cURL sanity
+```bash
+curl -X POST "$PUBLIC_BASE_URL/api/invoice" \
+  -H "Content-Type: application/json" \
+  -d '{"amount":1.23,"note":"Test","kind":"request","initData":"","payee":"0x..."}'
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+curl "$PUBLIC_BASE_URL/api/status?id=<requestId>"
+```
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### Production (Vercel)
+- Set the same env vars (omit `ALLOW_UNVERIFIED_INITDATA`)
+- Update BotFather Web App URL to the prod domain
+- Test from phone; `/api/invoice` must validate Telegram `initData`
