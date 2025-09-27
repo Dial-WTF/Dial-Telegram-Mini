@@ -25,9 +25,8 @@ export default function Providers({ children }: { children: React.ReactNode }) {
           // walletList: [...] // if you later want to customize external wallets ordering
         },
 
-        // Show a richer modal like the docs: email + socials + wallet
-        // Note: some OAuth providers may not work in Telegram IAB; enable per your needs
-        loginMethods: ['email', 'google', 'discord', 'wallet'],
+        // Enable methods per Privy dashboard (Telegram and Google may work depending on IAB)
+        loginMethods: ['telegram', 'google', 'email', 'wallet'],
 
         // Temporarily disable external wallets until config is finalized
         // externalWallets: { walletConnect: { enabled: true } },

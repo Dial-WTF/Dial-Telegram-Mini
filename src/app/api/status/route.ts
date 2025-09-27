@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { RequestNetwork } from "@requestnetwork/request-client.js";
+import { appConfig } from "@/lib/config";
 export const runtime = 'nodejs';
 
 export async function GET(req: NextRequest) {
@@ -7,10 +8,10 @@ export async function GET(req: NextRequest) {
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
   try {
-    if (process.env.REQUEST_API_KEY) {
-      const apiBase = process.env.REQUEST_REST_BASE || 'https://api.request.network/v1';
+    if (appConfig.request.apiKey) {
+      const apiBase = appConfig.request.restBase;
       const resp = await fetch(`${apiBase}/request/${id}`, {
-        headers: { 'x-api-key': process.env.REQUEST_API_KEY as string, 'Accept': 'application/json' },
+        headers: { 'x-api-key': appConfig.request.apiKey as string, 'Accept': 'application/json' },
       });
       if (!resp.ok) {
         return NextResponse.json({ status: 'error', error: `REST ${resp.status}` });
@@ -21,9 +22,7 @@ export async function GET(req: NextRequest) {
     }
     const client = new RequestNetwork({
       nodeConnectionConfig: {
-        baseURL:
-          process.env.REQUEST_NODE_URL ||
-          "https://main.gateway.request.network",
+        baseURL: appConfig.request.nodeUrl,
       },
     });
 

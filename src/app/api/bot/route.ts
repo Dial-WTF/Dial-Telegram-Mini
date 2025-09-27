@@ -44,17 +44,77 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // /request <amount>
+    // /request <amount> [note...]
     if (/^\/request\b/.test(text)) {
-      const parts = text.split(/\s+/);
+      const parts = text.trim().split(/\s+/);
       const amt = Number(parts[1] || '0');
+      const note = parts.slice(2).join(' ');
       if (!Number.isFinite(amt) || amt <= 0) {
-        await reply('Usage: /request <amount>');
+        await reply('Usage: /request <amount> [note]');
         return NextResponse.json({ ok: true });
       }
-      // TODO: optionally create a Request Network invoice here and reply with link
-      await reply(`Request created for $${amt.toFixed(2)}. Open the app to share link.`);
-      return NextResponse.json({ ok: true });
+
+      try {
+        // Create Request invoice via REST (avoids TMA initData requirement)
+        const apiBase = process.env.REQUEST_REST_BASE || 'https://api.request.network/v1';
+        const payee = process.env.PAYEE_ADDR as string;
+        if (!payee) {
+          await reply('Server not configured: missing PAYEE_ADDR');
+          return NextResponse.json({ ok: true });
+        }
+        const rest = await fetch(`${apiBase}/request`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            ...(process.env.REQUEST_API_KEY ? { 'x-api-key': process.env.REQUEST_API_KEY as string } : {}),
+          },
+          body: JSON.stringify({
+            payee,
+            amount: String(amt),
+            invoiceCurrency: 'USD',
+            paymentCurrency: 'USDC-base',
+          }),
+        });
+        if (!rest.ok) {
+          const t = await rest.text();
+          await reply(`Failed to create invoice: ${rest.status} ${rest.statusText}`);
+          return NextResponse.json({ ok: true, error: t });
+        }
+        const json = await rest.json();
+        const id = json.paymentReference || json.requestID || json.requestId;
+        if (!id) {
+          await reply('Invoice created but id missing');
+          return NextResponse.json({ ok: true });
+        }
+        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const payUrl = `${baseUrl}/pay/${id}`;
+
+        // Try to send an image + caption if we have a public asset base
+        const photoUrl = process.env.PUBLIC_BASE_URL ? `${baseUrl}/dial-neon.png` : null;
+        const caption = `Request: $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`;
+        const keyboard = {
+          inline_keyboard: [[{ text: 'Open', url: payUrl }]],
+        };
+
+        if (photoUrl) {
+          await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendPhoto`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption, reply_markup: keyboard }),
+          });
+        } else {
+          await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, text: caption + '\n' + payUrl, reply_markup: keyboard }),
+          });
+        }
+        return NextResponse.json({ ok: true, id, payUrl });
+      } catch (err: any) {
+        await reply(`Error creating request: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
     }
 
     // /pay <toAddress> <amount>

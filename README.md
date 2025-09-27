@@ -21,6 +21,17 @@ ALLOW_UNVERIFIED_INITDATA=1  # dev bypass; omit in prod
 PAYEE_ADDR=                  # your org/payee EVM address
 FEE_ADDR=                    # optional; defaults to PAYEE_ADDR
 NEXT_PUBLIC_PRIVY_APP_ID=    # Privy App ID
+NEXT_PUBLIC_ONRAMP=COINBASE  # or MOONPAY
+NEXT_PUBLIC_COINBASE_APP_ID= # Coinbase Onramp App ID (NOT API key)
+COINBASE_DEFAULT_ASSET=USDC
+COINBASE_DEFAULT_FIAT=USD
+COINBASE_DEFAULT_FIAT_AMOUNT=20
+# If your Coinbase Onramp app requires a session token, set this (temporary dev only):
+# COINBASE_SESSION_TOKEN=    # server-generated session token per Coinbase docs
+NEXT_PUBLIC_MOONPAY_KEY=     # MoonPay public key (if using MOONPAY)
+MOONPAY_SECRET_KEY=          # MoonPay secret for URL signature
+MOONPAY_DEFAULT_CURRENCY_CODE=usdc
+MOONPAY_DEFAULT_BASE_CURRENCY=usd
 ```
 
 ### Dev setup
@@ -45,6 +56,15 @@ npx ngrok http 3000
 - `/api/status` (GET)
   - `?id=<requestId>` → rehydrates the request and returns `{ status: 'pending'|'paid', balance }`
 
+- `/api/onramp/coinbase` (GET)
+  - Redirects to Coinbase Hosted Onramp: `https://pay.coinbase.com/buy`
+  - Params: `appId`, optional `addresses=[{address,blockchains:['base']}]`, `amount`, `fiatCurrency`, optional `assets` (USDC/ETH/...)
+  - If your Onramp app enforces secure initialization, a `sessionToken` is required. Provide `COINBASE_SESSION_TOKEN` (dev) or implement a server endpoint to mint tokens per Coinbase [security requirements](https://docs.cdp.coinbase.com/onramp-&-offramp/security-requirements).
+
+- `/api/onramp/moonpay` (GET)
+  - Redirects to MoonPay `https://buy.moonpay.com` with a signed query
+  - Requires `NEXT_PUBLIC_MOONPAY_KEY` and `MOONPAY_SECRET_KEY`
+
 All API routes export `runtime = 'nodejs'` to avoid Edge limitations.
 
 ### Client behavior
@@ -52,6 +72,11 @@ All API routes export `runtime = 'nodejs'` to avoid Edge limitations.
 - Privy `ensureWallet()` prompts login if not authenticated, then reads `wallets[0].address`
 - POST to `/api/invoice` with `{ kind, amount:Number, note, initData, payee }`
 - On success, opens `payUrl` inside Telegram webview
+
+Funding (Add funds)
+- Tries Privy `fundWallet` with `card.preferredProvider` from `NEXT_PUBLIC_ONRAMP`
+- If the widget fails in Telegram IAB, we auto-fallback to an iframe overlay and an “Open in browser” button
+- Known limitation: many onramps restrict flows inside Telegram’s webview; “Open in browser” is the reliable path
 
 ### cURL sanity
 ```bash
@@ -66,3 +91,11 @@ curl "$PUBLIC_BASE_URL/api/status?id=<requestId>"
 - Set the same env vars (omit `ALLOW_UNVERIFIED_INITDATA`)
 - Update BotFather Web App URL to the prod domain
 - Test from phone; `/api/invoice` must validate Telegram `initData`
+
+### WIP: Coinbase Onramp session token
+- If you see a Coinbase page saying "Missing or invalid parameters: requires sessionToken" your Onramp app is configured to require secure initialization.
+- For dev:
+  - Option A: Temporarily disable session token requirement in the Coinbase portal
+  - Option B: Provide `COINBASE_SESSION_TOKEN` (server-generated) and restart
+- For prod:
+  - Implement a backend endpoint to mint session tokens after authenticating the user (see Coinbase docs) and pass it through the `/api/onramp/coinbase` redirect.
