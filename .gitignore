@@ -42,4 +42,4 @@ yarn-error.log*
 next-env.d.ts
 
 # llm-example files & folders
-/llm-example/
+/llm-example

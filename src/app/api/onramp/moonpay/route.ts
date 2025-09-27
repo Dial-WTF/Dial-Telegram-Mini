@@ -9,6 +9,7 @@ export async function GET(req: NextRequest) {
   const secret = process.env.MOONPAY_SECRET_KEY;
   const defaultCurrencyCode = process.env.MOONPAY_DEFAULT_CURRENCY_CODE || 'usdc';
   const defaultBaseCurrencyCode = process.env.MOONPAY_DEFAULT_BASE_CURRENCY || 'usd';
+  const defaultBaseAmount = process.env.MOONPAY_DEFAULT_BASE_AMOUNT || '20';
   const walletAddress = req.nextUrl.searchParams.get('walletAddress') || '';
 
   if (!apiKey || !secret) {
@@ -20,6 +21,8 @@ export async function GET(req: NextRequest) {
   url.searchParams.set('apiKey', apiKey);
   url.searchParams.set('currencyCode', defaultCurrencyCode);
   url.searchParams.set('baseCurrencyCode', defaultBaseCurrencyCode);
+  // Set default fiat amount (e.g., USD) shown in the widget
+  if (defaultBaseAmount) url.searchParams.set('baseCurrencyAmount', String(defaultBaseAmount));
   if (walletAddress) url.searchParams.set('walletAddress', walletAddress);
   url.searchParams.set('enableRecurringBuys', 'false');
 

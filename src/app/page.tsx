@@ -20,6 +20,11 @@ const t = {
 type Kind = "request" | "send";
 
 export default function Home() {
+  // Preferred onramp provider from env (build-time). Set NEXT_PUBLIC_ONRAMP=COINBASE or MOONPAY
+  const onrampEnv = (process.env.NEXT_PUBLIC_ONRAMP || "coinbase").toLowerCase();
+  const preferredProvider = onrampEnv === "moonpay" ? "moonpay" : "coinbase";
+  const onrampPath = preferredProvider === "moonpay" ? "/api/onramp/moonpay" : "/api/onramp/coinbase";
+  const [onrampUrl, setOnrampUrl] = useState<string | null>(null);
   const [amount, setAmount] = useState<string>("1.00");
   const [note, setNote] = useState<string>("");
   const [loading, setLoading] = useState(false);
@@ -78,6 +83,29 @@ export default function Home() {
     }
   }
 
+  function openDirectOnramp(addr?: string, opts?: { preferIframe?: boolean }) {
+    try {
+      // Best-effort close of Privy modal if open
+      const closePrivyModalIfOpen = () => {
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' } as any)); } catch {}
+        const candidates = Array.from(document.querySelectorAll('button, [role="button"]')) as HTMLElement[];
+        const closeBtn = candidates.find((el) => /close|dismiss/i.test(el.getAttribute('aria-label') || '') || /×|✕|close/i.test(el.textContent || ''));
+        closeBtn?.click?.();
+      };
+      closePrivyModalIfOpen();
+    } catch {}
+    const url = `${onrampPath}${addr ? `?walletAddress=${addr}` : ''}`;
+    if (opts?.preferIframe !== false) {
+      setOnrampUrl(url);
+      return;
+    }
+    const tg = tgRef.current;
+    if (tg?.openLink && typeof tg.openLink === 'function') {
+      try { tg.openLink(url); return; } catch {}
+    }
+    window.open(url, '_blank');
+  }
+
   async function onFund() {
     try {
       if (!payee) {
@@ -88,20 +116,50 @@ export default function Home() {
         alert('Wallet not ready yet. Please try again in a moment.');
         return;
       }
-      // Use the two-argument signature per Privy web docs
-      await (fundWallet as any)(to, { asset: 'USDC' });
-    } catch (e: any) {
-      const msg = String(e?.message || e || '').toLowerCase();
-      if (
-        msg.includes('funding is not enabled') ||
-        msg.includes('unable to initialize') ||
-        msg.includes('not enabled')
-      ) {
-        const to = wallets?.[0]?.address || '';
-        window.open(`/api/onramp/moonpay${to ? `?walletAddress=${to}` : ''}`, '_blank');
+      let fallbackTriggered = false;
+      const safeFallback = () => {
+        if (fallbackTriggered) return;
+        fallbackTriggered = true;
+        openDirectOnramp(to, { preferIframe: true });
+      };
+
+      const watchdog = setTimeout(() => {
+        // If nothing happened within a short window, assume widget couldn\'t initialize in IAB
+        safeFallback();
+      }, 2500);
+
+      // Use object signature expected by Privy SDK and handle widget-level errors
+      try {
+        await (fundWallet as any)({
+          address: to,
+          chain: { id: 8453 },
+          card: { preferredProvider },
+          onError: () => {
+            // If Privy widget fails to initialize (e.g., IAB/cookies), fall back to direct onramp
+            clearTimeout(watchdog);
+            safeFallback();
+          },
+          onExit: (_res: any) => {
+            // Clear watchdog and decide based on result
+            clearTimeout(watchdog);
+            try {
+              if (!_res?.status || String(_res.status).toLowerCase() !== 'success') {
+                safeFallback();
+              }
+            } catch {
+              safeFallback();
+            }
+          },
+        });
+      } catch {
+        clearTimeout(watchdog);
+        safeFallback();
         return;
       }
-      alert(e?.message || 'Unable to start funding');
+    } catch (e: any) {
+      // Final catch fallback for non-widget errors
+      const addr = wallets?.[0]?.address || '';
+      openDirectOnramp(addr, { preferIframe: true });
     }
   }
 
@@ -271,6 +329,51 @@ export default function Home() {
         </div>
 
         <BottomNav className="mt-2 shrink-0" />
+
+        {onrampUrl ? (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70"
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="w-[92vw] max-w-xl h-[80vh] bg-black rounded-2xl overflow-hidden border" style={{ borderColor: '#163a29' }}>
+              <div className="flex items-center justify-between px-3 py-2 text-xs" style={{ color: t.sub, background: '#0b1610' }}>
+                <span>Secure funding</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      const url = onrampUrl;
+                      if (!url) return;
+                      const tg = (tgRef as any)?.current;
+                      if (tg?.openLink && typeof tg.openLink === 'function') {
+                        try { tg.openLink(url); return; } catch {}
+                      }
+                      window.open(url, '_blank');
+                    }}
+                    className="px-2 py-1 rounded-md font-semibold"
+                    style={{ background: '#12331f', color: t.text }}
+                  >
+                    Open in browser
+                  </button>
+                  <button
+                    onClick={() => setOnrampUrl(null)}
+                    className="px-2 py-1 rounded-md font-semibold"
+                    style={{ background: '#1f2937', color: t.text }}
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+              <iframe
+                key={onrampUrl}
+                src={onrampUrl}
+                title="Onramp"
+                className="w-full h-full"
+                allow="accelerometer; autoplay; camera; gyroscope; payment *; clipboard-write; encrypted-media"
+              />
+            </div>
+          </div>
+        ) : null}
       </div>
     </main>
   );
