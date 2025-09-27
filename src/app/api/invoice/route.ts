@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { validate } from "@telegram-apps/init-data-node";
 import { RequestNetwork, Types } from "@requestnetwork/request-client.js";
+import { appConfig } from "@/lib/config";
 export const runtime = 'nodejs';
 
 export async function POST(req: NextRequest) {
@@ -8,9 +9,7 @@ export async function POST(req: NextRequest) {
     const { amount, note, kind, initData, payee } = await req.json();
 
     // Allow browser testing outside Telegram in dev
-    const allowBypass =
-      process.env.ALLOW_UNVERIFIED_INITDATA === "1" &&
-      process.env.NODE_ENV !== "production";
+    const allowBypass = appConfig.allowUnverifiedInitData;
 
     if (!allowBypass) {
       if (!initData || typeof initData !== "string" || !initData.includes("hash=")) {
@@ -19,7 +18,7 @@ export async function POST(req: NextRequest) {
           { status: 401 }
         );
       }
-      validate(initData, process.env.BOT_TOKEN!);
+      validate(initData, appConfig.telegram.botToken!);
     }
 
     const amt = Number(amount);
@@ -28,13 +27,13 @@ export async function POST(req: NextRequest) {
     }
 
     // If REQUEST_API_KEY is set, use REST API fallback to avoid client bundling issues
-    const useRest = !!process.env.REQUEST_API_KEY;
+    const useRest = !!appConfig.request.apiKey;
     let requestId: string | undefined;
     let paymentReference: string | undefined;
     if (useRest) {
-      const apiBase = process.env.REQUEST_REST_BASE || 'https://api.request.network/v1';
+      const apiBase = appConfig.request.restBase;
       const payload = {
-        payee: payee || process.env.PAYEE_ADDR!,
+        payee: payee || appConfig.payeeAddr!,
         amount: String(amt),
         invoiceCurrency: 'USD',
         paymentCurrency: 'USDC-base',
@@ -43,7 +42,7 @@ export async function POST(req: NextRequest) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': process.env.REQUEST_API_KEY as string,
+          'x-api-key': appConfig.request.apiKey as string,
           'Accept': 'application/json',
         },
         body: JSON.stringify(payload),
@@ -53,25 +52,26 @@ export async function POST(req: NextRequest) {
         throw new Error(`Request REST error: ${resp.status} ${resp.statusText} ${txt}`);
       }
       const json = await resp.json();
-      requestId = json.requestID;
+      requestId = json.requestID || json.requestId;
       paymentReference = json.paymentReference;
-      const idForUrl = paymentReference || requestId!;
-      const payUrl = `${process.env.PUBLIC_BASE_URL}/pay/${idForUrl}`;
+      const idForUrl = paymentReference || requestId;
+      if (!idForUrl) throw new Error('Missing request id from Request REST response');
+      const base = appConfig.publicBaseUrl || '';
+      const payUrl = base ? `${base}/pay/${idForUrl}` : `/pay/${idForUrl}`;
       return NextResponse.json({ requestId: idForUrl, payUrl });
     }
 
     const client = new RequestNetwork({
       nodeConnectionConfig: {
         baseURL:
-          process.env.REQUEST_NODE_URL || "https://main.gateway.request.network",
+          appConfig.request.nodeUrl,
       },
     });
 
     // Configuration via env
-    const chain = (process.env.REQUEST_CHAIN || "base").toLowerCase();
-    const DEFAULT_BASE_USDC = "0x833589fCD6EDb6E08f4c7C32D4f71b54bdA02913"; // official USDC on Base
-    const erc20Address = (process.env.ERC20_TOKEN_ADDRESS || "").trim();
-    const currencyValue = erc20Address !== "" ? erc20Address : DEFAULT_BASE_USDC;
+    const chain = appConfig.request.chain;
+    const erc20Address = (appConfig.request.erc20Address || "").trim();
+    const currencyValue = erc20Address !== "" ? erc20Address : appConfig.request.defaultBaseUSDC;
 
     // USDC default decimals (6). If you change token, adjust decimals accordingly.
     const expectedAmount = BigInt(Math.round(amt * 1e6)).toString();
@@ -86,23 +86,23 @@ export async function POST(req: NextRequest) {
         expectedAmount,
         payee: {
           type: Types.Identity.TYPE.ETHEREUM_ADDRESS,
-          value: payee || process.env.PAYEE_ADDR!,
+          value: payee || appConfig.payeeAddr!,
         },
         timestamp: Math.floor(Date.now() / 1000),
       },
       // Server "signs" the request creation (identity). Keep this as your payee/org address.
       signer: {
         type: Types.Identity.TYPE.ETHEREUM_ADDRESS,
-        value: process.env.PAYEE_ADDR!,
+        value: appConfig.payeeAddr!,
       },
       contentData: { note, kind, brand: "Dial" },
       paymentNetwork: {
         id: Types.Extension.PAYMENT_NETWORK_ID.ERC20_FEE_PROXY_CONTRACT,
         parameters: {
           paymentNetworkName: chain as any,
-          feeAddress: process.env.FEE_ADDR || process.env.PAYEE_ADDR!,
+          feeAddress: appConfig.feeAddr || appConfig.payeeAddr!,
           feeAmount: "0",
-          paymentAddress: payee || process.env.PAYEE_ADDR!,
+          paymentAddress: payee || appConfig.payeeAddr!,
         },
       },
     });
@@ -110,7 +110,8 @@ export async function POST(req: NextRequest) {
     await created.waitForConfirmation();
 
     const requestIdClient = created.requestId;
-    const payUrl = `${process.env.PUBLIC_BASE_URL}/pay/${requestIdClient}`;
+    const base = appConfig.publicBaseUrl || '';
+    const payUrl = base ? `${base}/pay/${requestIdClient}` : `/pay/${requestIdClient}`;
     return NextResponse.json({ requestId: requestIdClient, payUrl });
   } catch (e: any) {
     console.error("Invoice error:", e);
