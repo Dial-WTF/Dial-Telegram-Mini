@@ -99,3 +99,39 @@ curl "$PUBLIC_BASE_URL/api/status?id=<requestId>"
   - Option B: Provide `COINBASE_SESSION_TOKEN` (server-generated) and restart
 - For prod:
   - Implement a backend endpoint to mint session tokens after authenticating the user (see Coinbase docs) and pass it through the `/api/onramp/coinbase` redirect.
+
+### Domain whitelisting and bot linkage (Important for dev tunnels)
+Many providers block unknown origins and IAB contexts. Any time your ngrok URL changes, update all allowlists:
+
+- Privy (Allowed origins)
+- Coinbase Onramp (Allowed origins / app settings)
+- MoonPay (Allowed origins)
+- Google OAuth (Authorized JavaScript origins and redirect URIs)
+- Telegram (Bot Web App URL)
+
+Recommended: Always use HTTPS ngrok domain (e.g., `https://dial.ngrok.app`). If the subdomain rotates, revisit each dashboard and re-add it.
+
+#### Telegram bots ↔ domains (local vs prod)
+All bots are owned by Adam. Current linkage:
+
+- Dial Betabot → `https://dev.tgbot.dial.wtf` (development)
+- Alpha Dialbot → `https://dial.ngrok.app` (local dev tunnel)
+- Dial Official Bot → `https://tgbot.dial.wtf` (production)
+- Dial WTF Bot → `https://tgbot.dial.wtf` (production)
+
+Each bot has its own token and must be configured with the correct Web App URL and webhook.
+
+#### Webhook and env sync
+Use `scripts/sync-env-and-webhook.sh` to push env vars to Vercel and set the webhook for the current `.env.local`:
+
+```bash
+scripts/sync-env-and-webhook.sh development .env.local
+# or preview/production
+```
+
+Env must include:
+- `PUBLIC_BASE_URL` (matches the bot’s Web App URL)
+- `BOT_TOKEN` (for the specific bot you’re linking)
+
+This script sets the webhook to `${PUBLIC_BASE_URL}/api/bot` for the provided `BOT_TOKEN`.
+
