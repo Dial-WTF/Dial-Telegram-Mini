@@ -1,25 +1,43 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { appConfig } from '@/lib/config';
+import { parseEther } from 'ethers';
+import { parseRequest } from '@/lib/parse';
+import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '@/lib/addr';
+import { tg } from '@/lib/telegram';
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
 const pendingAddressByUser = new Map<number, { amount: number; note: string }>();
 
 async function resolveEnsOrAddress(input: string): Promise<string | undefined> {
-  const trimmed = input.trim();
-  if (/^0x[0-9a-fA-F]{40}$/.test(trimmed)) return trimmed;
-  if (/^[a-z0-9\-_.]+\.[a-z]{2,}$/i.test(trimmed)) {
-    try {
-      const r = await fetch(`https://api.ensideas.com/ens/resolve/${encodeURIComponent(trimmed)}`);
-      if (!r.ok) return undefined;
-      const j: any = await r.json();
-      const addr = j?.address as string | undefined;
-      if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) return addr;
-    } catch {}
-  }
-  return undefined;
+  return resolveEnsToHex(input, process.env.RPC_URL);
 }
 
 export const runtime = 'nodejs';
+
+const DEBUG = process.env.DEBUG_BOT === '1';
+const DRY = process.env.BOT_DRY_RUN === '1';
+
+async function tgCall(method: string, payload: any): Promise<any> {
+  if (DRY) {
+    try { console.log(`[BOT_DRY_RUN] ${method}`, payload); } catch {}
+    return { ok: true, result: { message_id: 1 } } as any;
+  }
+  const res = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+  });
+  try {
+    const json = await res.json();
+    if (DEBUG) {
+      try { console.log(`[TG] ${method} ->`, json); } catch {}
+    }
+    return json;
+  } catch {
+    if (DEBUG) {
+      try { console.log(`[TG] ${method} http=${res.status} ok=${res.ok}`); } catch {}
+    }
+    return { ok: res.ok };
+  }
+}
 
 // Lazy-initialize Privy client at runtime to avoid build-time dependency
 async function getPrivyClient() {
@@ -106,14 +124,11 @@ export async function POST(req: NextRequest) {
 
     if (!chatId || !tgUserId) return NextResponse.json({ ok: true });
 
-    const reply = async (text: string) => {
-      const res = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text }),
-      });
-      return res.ok;
-    };
+    const reply = async (text: string) => { const r = await tg.sendMessage(chatId, text); return !!r?.ok; };
+
+    if (DEBUG) {
+      await reply(`dbg: chatType=${chatType} isCmd=${typeof text === 'string' && text.startsWith('/')} text="${text}"`);
+    }
 
     // Avoid spamming group chats: only act on slash commands. In DMs, allow normal flow.
     const isCommand = typeof text === 'string' && text.startsWith('/');
@@ -130,19 +145,42 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true });
       }
       try {
-        const apiBase = process.env.REQUEST_REST_BASE || 'https://api.request.network/v1';
-        const rest = await fetch(`${apiBase}/request`, {
+        const rawBase = process.env.REQUEST_BASE_URL || process.env.REQUEST_REST_BASE || 'https://api.request.network';
+        const baseTrim = rawBase.replace(/\/$/, '');
+        const endpoint = /\/v1$/.test(baseTrim)
+          ? `${baseTrim}/request`
+          : /\/v2$/.test(baseTrim)
+          ? `${baseTrim}/request`
+          : `${baseTrim}/v2/request`;
+        const rest = await fetch(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            ...(process.env.REQUEST_API_KEY ? { 'x-api-key': process.env.REQUEST_API_KEY as string } : {}),
+            ...(process.env.REQUEST_API_KEY ? { 'X-Api-Key': process.env.REQUEST_API_KEY as string, 'x-api-key': process.env.REQUEST_API_KEY as string } : {}),
           },
           body: JSON.stringify({
             payee: addr,
             amount: String(ctx.amount),
-            invoiceCurrency: 'USD',
-            paymentCurrency: 'USDC-base',
+            invoiceCurrency: 'ETH-mainnet',
+            paymentCurrency: 'ETH-mainnet',
+            reference: ctx.note || '',
+            paymentNetwork: {
+              id: 'ETH_FEE_PROXY_CONTRACT',
+              parameters: {
+                paymentNetworkName: 'mainnet',
+                paymentAddress: addr,
+                feeAddress: process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!,
+                feeAmount: (() => {
+                  try {
+                    const bps = Number(process.env.FEE_BPS || '50');
+                    const wei = parseEther(String(ctx.amount));
+                    const fee = (wei * BigInt(bps)) / 10000n;
+                    return fee.toString();
+                  } catch { return '0'; }
+                })()
+              }
+            }
           }),
         });
         if (!rest.ok) {
@@ -156,10 +194,7 @@ export async function POST(req: NextRequest) {
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const payUrl = `${baseUrl}/pay/${id}`;
         const keyboard = { inline_keyboard: [[{ text: 'Open', web_app: { url: payUrl } }]] } as any;
-        await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, text: `Request: $${ctx.amount.toFixed(2)}${ctx.note ? ` — ${ctx.note}` : ''}`, reply_markup: keyboard }),
-        });
+        await tg.sendMessage(chatId, `Request: $${ctx.amount.toFixed(2)}${ctx.note ? ` — ${ctx.note}` : ''}`,);
         pendingAddressByUser.delete(tgUserId);
         return NextResponse.json({ ok: true, id, payUrl });
       } catch (err: any) {
@@ -176,37 +211,26 @@ export async function POST(req: NextRequest) {
 
     // /request <amount> [note] [destination]
     if (/^\/request\b/i.test(text)) {
-      // Robust parsing: allow /request@BotName 5 note dest (tolerant to extra whitespace)
-      let amt = NaN as number;
-      let tokens: string[] = [];
-      const m = text.match(/^\/request(?:@[^\s]+)?\s+([0-9]+(?:\.[0-9]+)?)(?:\s+([\s\S]*))?$/i);
-      if (m) {
-        amt = Number(m[1]);
-        tokens = m[2] ? m[2].trim().split(/\s+/) : [];
-      } else {
-        // Fallback extraction when the message includes odd formatting
-        const cleaned = text.replace(/^\/request(?:@[^\s]+)?/i, '').trim();
-        const m2 = cleaned.match(/([0-9]+(?:\.[0-9]+)?)/);
-        if (m2) {
-          amt = Number(m2[1]);
-          const rest = cleaned.slice(m2.index! + m2[0].length).trim();
-          tokens = rest ? rest.split(/\s+/) : [];
-        }
-      }
-      let explicitDest: string | undefined;
-      const last = tokens[tokens.length - 1];
-      if (last && (/^0x[0-9a-fA-F]{40}$/.test(last) || /\.[a-z]{2,}$/i.test(last))) {
-        explicitDest = last;
-        tokens = tokens.slice(0, -1);
-      }
-      const note = tokens.join(' ');
+      const parsed = parseRequest(text, process.env.BOT_USERNAME);
+      const amt = parsed.amount as number;
+      const note = parsed.memo;
+      const explicitDest = parsed.payeeCandidate;
       if (!Number.isFinite(amt) || amt <= 0) {
+        if (DEBUG) {
+          await reply(`dbg: parse failed. raw="${text}"`);
+        }
         await reply('Usage: /request <amount> [note] [destination]');
         return NextResponse.json({ ok: true });
       }
 
       try {
-        const apiBase = process.env.REQUEST_REST_BASE || 'https://api.request.network/v1';
+        const rawBase = process.env.REQUEST_BASE_URL || process.env.REQUEST_REST_BASE || 'https://api.request.network';
+        const baseTrim = rawBase.replace(/\/$/, '');
+        const endpoint = /\/v1$/.test(baseTrim)
+          ? `${baseTrim}/request`
+          : /\/v2$/.test(baseTrim)
+          ? `${baseTrim}/request`
+          : `${baseTrim}/v2/request`;
         // Resolve payee: explicit destination > linked wallet > env fallback
         let payee: string | undefined;
         if (explicitDest) {
@@ -238,20 +262,39 @@ export async function POST(req: NextRequest) {
           const keyboard = { inline_keyboard: [[{ text: 'Open app to link wallet', web_app: { url: baseUrl } }]] } as any;
           pendingAddressByUser.set(tgUserId, { amount: amt, note });
           const combinedText = 'No wallet linked. Open the app and sign in first, then retry /request.\n\nAlternatively, reply to this message with your receiving address or ENS.';
-          await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text: combinedText, reply_markup: keyboard }),
-          });
+          await tgCall('sendMessage', { chat_id: chatId, text: combinedText, reply_markup: keyboard });
           return NextResponse.json({ ok: true });
         }
 
-        const rest = await fetch(`${apiBase}/request`, {
+        const rest = await fetch(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json', 'Accept': 'application/json',
-            ...(process.env.REQUEST_API_KEY ? { 'x-api-key': process.env.REQUEST_API_KEY as string } : {}),
+            ...(process.env.REQUEST_API_KEY ? { 'X-Api-Key': process.env.REQUEST_API_KEY as string, 'x-api-key': process.env.REQUEST_API_KEY as string } : {}),
           },
-          body: JSON.stringify({ payee, amount: String(amt), invoiceCurrency: 'USD', paymentCurrency: 'USDC-base' }),
+          body: JSON.stringify({
+            payee,
+            amount: String(amt),
+            invoiceCurrency: 'ETH-mainnet',
+            paymentCurrency: 'ETH-mainnet',
+            reference: note || '',
+            paymentNetwork: {
+              id: 'ETH_FEE_PROXY_CONTRACT',
+              parameters: {
+                paymentNetworkName: 'mainnet',
+                paymentAddress: payee,
+                feeAddress: process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!,
+                feeAmount: (() => {
+                  try {
+                    const bps = Number(process.env.FEE_BPS || '50');
+                    const wei = parseEther(String(amt));
+                    const fee = (wei * BigInt(bps)) / 10000n;
+                    return fee.toString();
+                  } catch { return '0'; }
+                })()
+              }
+            }
+          }),
         });
         if (!rest.ok) {
           const t = await rest.text();
@@ -271,10 +314,7 @@ export async function POST(req: NextRequest) {
         const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(payUrl)}`;
         const caption = `Request: $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`;
         const keyboard = { inline_keyboard: [[{ text: 'Open invoice', web_app: { url: payUrl } }]] } as any;
-        const sent = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendPhoto`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, photo: qrUrl, caption, reply_markup: keyboard }),
-        }).then(r => r.json()).catch(() => ({} as any));
+        const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
 
         // Poll and update caption to ✅ PAID
         const messageId = sent?.result?.message_id as number | undefined;
@@ -286,10 +326,7 @@ export async function POST(req: NextRequest) {
               const s = await fetch(`${baseUrl}/api/status?id=${id}`).then(r => r.json());
               if (s?.status === 'paid') {
                 const paidCaption = `✅ PAID — $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`;
-                await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/editMessageCaption`, {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ chat_id: chatId, message_id: messageId, caption: paidCaption, reply_markup: keyboard }),
-                });
+                await tg.editCaption(chatId, messageId, paidCaption, keyboard);
                 break;
               }
             } catch {}
@@ -327,7 +364,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true });
       }
 
-      // Send a native transfer on Base (eip155:8453) or USDC transfer if desired
+      // Send a native transfer on Base (eip155:8453) @or USDC transfer if desired
       await privy.wallets().ethereum().sendTransaction(walletId, {
         caip2: 'eip155:8453',
         params: {

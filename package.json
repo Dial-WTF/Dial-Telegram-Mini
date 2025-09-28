@@ -6,7 +6,11 @@
     "dev": "next dev --turbopack",
     "build": "next build --turbopack",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:bot:dm": "curl -s -X POST $PUBLIC_BASE_URL/api/bot -H 'Content-Type: application/json' -d @tests/bot/dm-request.json | cat",
+    "test:bot:group": "curl -s -X POST $PUBLIC_BASE_URL/api/bot -H 'Content-Type: application/json' -d @tests/bot/group-request.json | cat",
+    "mate:info": "pnpm dlx @telegram-apps/mate@latest deploy info --project dial-telegram-mini | cat",
+    "mate:upload": "pnpm dlx @telegram-apps/mate@latest deploy upload --project dial-telegram-mini --dir ./public | cat"
   },
   "dependencies": {
     "@privy-io/node": "^0.2.0",
@@ -18,7 +22,8 @@
     "ethers": "^6.15.0",
     "next": "15.5.4",
     "react": "19.1.0",
-    "react-dom": "19.1.0"
+    "react-dom": "19.1.0",
+    "viem": "^2.37.9"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
