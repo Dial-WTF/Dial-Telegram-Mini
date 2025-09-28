@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@privy-io/node": "^0.2.0",
     "@privy-io/react-auth": "^3.0.1",
     "@requestnetwork/request-client.js": "^0.59.0",
     "@telegram-apps/init-data-node": "^2.0.10",
