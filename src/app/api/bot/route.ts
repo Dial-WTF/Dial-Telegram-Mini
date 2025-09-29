@@ -210,8 +210,181 @@ export async function POST(req: NextRequest) {
     }
 
     if (/^\/start/.test(text)) {
-      await reply('Dial Bot ready. Use /pay <to> <amt> or /request <amt>');
+      await reply('Dial Bot ready. Use /pay <to> <amt> or /request <amt>\n\nParty Lines:\n/startparty - Create a party room\n/listparty - List open party rooms\n/findparty <address> - Find party by contract address');
       return NextResponse.json({ ok: true });
+    }
+
+    // /startparty - Create a new party room on dial.wtf
+    if (/^\/startparty\b/i.test(text)) {
+      const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
+      if (!apiKey) {
+        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        return NextResponse.json({ ok: false }, { status: 200 });
+      }
+
+      // Get user's wallet address
+      let owner: string | undefined;
+      try {
+        const privy = await getPrivyClient();
+        if (privy) {
+          const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
+          const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+          const addr = (w as any)?.address as string | undefined;
+          if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) owner = addr;
+        }
+      } catch {}
+
+      if (!owner) {
+        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const keyboard = { inline_keyboard: [[{ text: 'Link wallet', web_app: { url: baseUrl } }]] } as any;
+        await tgCall('sendMessage', { chat_id: chatId, text: 'No wallet linked. Open the app and sign in first to create a party room.', reply_markup: keyboard });
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines', {
+          method: 'POST',
+          headers: {
+            'x-api-key': apiKey,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            owner,
+            telegramUserId: String(tgUserId),
+            telegramChatId: String(chatId),
+          }),
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          await reply(`Failed to create party room: ${response.status} ${response.statusText}`);
+          return NextResponse.json({ ok: false, error });
+        }
+
+        const data = await response.json();
+        const partyLineUrl = `https://staging.dial.wtf/party/${data.id || data.contractAddress || ''}`;
+        await reply(`🎉 Party room created!\n\nOwner: ${owner}\n${data.contractAddress ? `Contract: ${data.contractAddress}\n` : ''}${data.id ? `View: ${partyLineUrl}` : ''}`);
+        return NextResponse.json({ ok: true, data });
+      } catch (err: any) {
+        await reply(`Error creating party room: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /listparty - List all open party rooms
+    if (/^\/listparty\b/i.test(text)) {
+      const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
+      if (!apiKey) {
+        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        return NextResponse.json({ ok: false }, { status: 200 });
+      }
+
+      try {
+        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines', {
+          method: 'GET',
+          headers: {
+            'x-api-key': apiKey,
+          },
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          await reply(`Failed to fetch party rooms: ${response.status} ${response.statusText}`);
+          return NextResponse.json({ ok: false, error });
+        }
+
+        const data = await response.json();
+        const partyLines = Array.isArray(data) ? data : data.partyLines || [];
+
+        if (partyLines.length === 0) {
+          await reply('No open party rooms found. Use /startparty to create one!');
+          return NextResponse.json({ ok: true, data: [] });
+        }
+
+        let message = `🎊 Open Party Rooms (${partyLines.length}):\n\n`;
+        partyLines.slice(0, 10).forEach((party: any, idx: number) => {
+          const contractAddr = party.contractAddress || party.address || 'N/A';
+          const owner = party.owner || 'Unknown';
+          const status = party.status || 'active';
+          message += `${idx + 1}. ${contractAddr.slice(0, 10)}...\n   Owner: ${owner.slice(0, 10)}...\n   Status: ${status}\n\n`;
+        });
+
+        if (partyLines.length > 10) {
+          message += `\n...and ${partyLines.length - 10} more`;
+        }
+
+        await reply(message);
+        return NextResponse.json({ ok: true, data: partyLines });
+      } catch (err: any) {
+        await reply(`Error fetching party rooms: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /findparty <address> - Search for a party room by contract address
+    if (/^\/findparty\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const searchQuery = parts[1];
+
+      if (!searchQuery) {
+        await reply('Usage: /findparty <contract_address>');
+        return NextResponse.json({ ok: true });
+      }
+
+      const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
+      if (!apiKey) {
+        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        return NextResponse.json({ ok: false }, { status: 200 });
+      }
+
+      try {
+        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines', {
+          method: 'GET',
+          headers: {
+            'x-api-key': apiKey,
+          },
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          await reply(`Failed to search party rooms: ${response.status} ${response.statusText}`);
+          return NextResponse.json({ ok: false, error });
+        }
+
+        const data = await response.json();
+        const partyLines = Array.isArray(data) ? data : data.partyLines || [];
+
+        // Search by contract address or partial match
+        const matches = partyLines.filter((party: any) => {
+          const contractAddr = (party.contractAddress || party.address || '').toLowerCase();
+          const search = searchQuery.toLowerCase();
+          return contractAddr.includes(search) || contractAddr === search;
+        });
+
+        if (matches.length === 0) {
+          await reply(`No party rooms found matching: ${searchQuery}`);
+          return NextResponse.json({ ok: true, data: [] });
+        }
+
+        let message = `🔍 Found ${matches.length} matching party room${matches.length > 1 ? 's' : ''}:\n\n`;
+        matches.slice(0, 5).forEach((party: any, idx: number) => {
+          const contractAddr = party.contractAddress || party.address || 'N/A';
+          const owner = party.owner || 'Unknown';
+          const status = party.status || 'active';
+          const partyUrl = `https://staging.dial.wtf/party/${party.id || contractAddr}`;
+          message += `${idx + 1}. ${contractAddr}\n   Owner: ${owner}\n   Status: ${status}\n   URL: ${partyUrl}\n\n`;
+        });
+
+        if (matches.length > 5) {
+          message += `\n...and ${matches.length - 5} more`;
+        }
+
+        await reply(message);
+        return NextResponse.json({ ok: true, data: matches });
+      } catch (err: any) {
+        await reply(`Error searching party rooms: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
     }
 
     // /request <amount> [note] [destination]
