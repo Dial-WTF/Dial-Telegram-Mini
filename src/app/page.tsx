@@ -1,22 +1,30 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Image from "next/image";
 import { usePrivy, useWallets, useFundWallet } from "@privy-io/react-auth"; // embedded wallet & funding
+import BottomNav from "@/components/BottomNav";
 
-// Dial theme tokens
+// Dial retro neon theme (purple)
 const t = {
-  bg: "#0a0612",
+  bg: "radial-gradient(80% 60% at 50% 0%, #0b0713 0%, #0a0612 40%, #07040e 100%)",
   card: "#141021",
   text: "#EDE9FE",
   sub: "#B8A6F8",
-  accent1: "#7C3AED",
-  accent2: "#C026D3",
+  accent1: "#7C3AED", // purple
+  accent2: "#C026D3", // fuchsia
   glow: "0 10px 40px rgba(124,58,237,.25)",
+  border: "1px solid rgba(124,58,237,.35)",
 };
 
 type Kind = "request" | "send";
 
 export default function Home() {
+  // Preferred onramp provider from env (build-time). Set NEXT_PUBLIC_ONRAMP=COINBASE or MOONPAY
+  const onrampEnv = (process.env.NEXT_PUBLIC_ONRAMP || "coinbase").toLowerCase();
+  const preferredProvider = onrampEnv === "moonpay" ? "moonpay" : "coinbase";
+  const onrampPath = preferredProvider === "moonpay" ? "/api/onramp/moonpay" : "/api/onramp/coinbase";
+  const [onrampUrl, setOnrampUrl] = useState<string | null>(null);
   const [amount, setAmount] = useState<string>("1.00");
   const [note, setNote] = useState<string>("");
   const [loading, setLoading] = useState(false);
@@ -75,6 +83,29 @@ export default function Home() {
     }
   }
 
+  function openDirectOnramp(addr?: string, opts?: { preferIframe?: boolean }) {
+    try {
+      // Best-effort close of Privy modal if open
+      const closePrivyModalIfOpen = () => {
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' } as any)); } catch {}
+        const candidates = Array.from(document.querySelectorAll('button, [role="button"]')) as HTMLElement[];
+        const closeBtn = candidates.find((el) => /close|dismiss/i.test(el.getAttribute('aria-label') || '') || /×|✕|close/i.test(el.textContent || ''));
+        closeBtn?.click?.();
+      };
+      closePrivyModalIfOpen();
+    } catch {}
+    const url = `${onrampPath}${addr ? `?walletAddress=${addr}` : ''}`;
+    if (opts?.preferIframe !== false) {
+      setOnrampUrl(url);
+      return;
+    }
+    const tg = tgRef.current;
+    if (tg?.openLink && typeof tg.openLink === 'function') {
+      try { tg.openLink(url); return; } catch {}
+    }
+    window.open(url, '_blank');
+  }
+
   async function onFund() {
     try {
       if (!payee) {
@@ -85,20 +116,50 @@ export default function Home() {
         alert('Wallet not ready yet. Please try again in a moment.');
         return;
       }
-      // Use the two-argument signature per Privy web docs
-      await (fundWallet as any)(to, { asset: 'USDC' });
-    } catch (e: any) {
-      const msg = String(e?.message || e || '').toLowerCase();
-      if (
-        msg.includes('funding is not enabled') ||
-        msg.includes('unable to initialize') ||
-        msg.includes('not enabled')
-      ) {
-        const to = wallets?.[0]?.address || '';
-        window.open(`/api/onramp/moonpay${to ? `?walletAddress=${to}` : ''}`, '_blank');
+      let fallbackTriggered = false;
+      const safeFallback = () => {
+        if (fallbackTriggered) return;
+        fallbackTriggered = true;
+        openDirectOnramp(to, { preferIframe: true });
+      };
+
+      const watchdog = setTimeout(() => {
+        // If nothing happened within a short window, assume widget couldn\'t initialize in IAB
+        safeFallback();
+      }, 2500);
+
+      // Use object signature expected by Privy SDK and handle widget-level errors
+      try {
+        await (fundWallet as any)({
+          address: to,
+          chain: { id: 8453 },
+          card: { preferredProvider },
+          onError: () => {
+            // If Privy widget fails to initialize (e.g., IAB/cookies), fall back to direct onramp
+            clearTimeout(watchdog);
+            safeFallback();
+          },
+          onExit: (_res: any) => {
+            // Clear watchdog and decide based on result
+            clearTimeout(watchdog);
+            try {
+              if (!_res?.status || String(_res.status).toLowerCase() !== 'success') {
+                safeFallback();
+              }
+            } catch {
+              safeFallback();
+            }
+          },
+        });
+      } catch {
+        clearTimeout(watchdog);
+        safeFallback();
         return;
       }
-      alert(e?.message || 'Unable to start funding');
+    } catch (e: any) {
+      // Final catch fallback for non-widget errors
+      const addr = wallets?.[0]?.address || '';
+      openDirectOnramp(addr, { preferIframe: true });
     }
   }
 
@@ -121,8 +182,17 @@ export default function Home() {
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-      // Open pay page (inside Telegram webview)
-      tg?.openLink?.(data.payUrl);
+      // Share link back to chat (preferred), fallback to opening
+      if (tg?.shareURL && typeof tg.shareURL === 'function') {
+        const text = `Request: $${Number(amount).toFixed(2)}${note ? ` — ${note}` : ''}`;
+        try {
+          await tg.shareURL(data.payUrl, { text });
+        } catch {
+          tg?.openLink?.(data.payUrl);
+        }
+      } else {
+        tg?.openLink?.(data.payUrl);
+      }
     } catch (e: any) {
       alert(e.message ?? "Failed to create invoice");
     } finally {
@@ -132,54 +202,50 @@ export default function Home() {
 
   return (
     <main
-      className="min-h-screen flex items-center justify-center p-6"
+      className="min-h-[100dvh] flex items-stretch justify-center p-3 sm:p-4 overflow-hidden"
       style={{ background: t.bg, color: t.text }}
     >
       <div
-        className="w-full max-w-md relative p-6 rounded-2xl"
+        className="w-full max-w-md relative p-4 sm:p-5 rounded-3xl flex flex-col"
         style={{
           background: t.card,
           boxShadow: t.glow,
-          border: "1px solid rgba(124,58,237,.25)",
+          border: t.border,
         }}
       >
-        {/* gradient border */}
-        <div
-          aria-hidden
-          className="pointer-events-none absolute inset-0 rounded-2xl"
-          style={{
-            padding: 1,
-            background:
-              "linear-gradient(135deg, rgba(56,189,248,.35), rgba(168,85,247,.30), rgba(217,70,239,.35))",
-            WebkitMask:
-              "linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)",
-            WebkitMaskComposite: "xor" as any,
-            maskComposite: "exclude" as any,
-          }}
-        />
-
-        <header className="mb-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h1 className="text-2xl font-extrabold">Dial Pay</h1>
-              <p className="text-sm" style={{ color: t.sub }}>
-                Request or Send — powered by Request Network
-              </p>
+        <div className="flex-1 overflow-y-auto overscroll-contain">
+        <header className="mb-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div
+                className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
+                style={{ background: "#2b1b4b", color: t.text, border: t.border }}
+              >
+                {(user?.email?.address?.[0] || "D").toUpperCase()}
+              </div>
+              <div className="text-sm">
+                <div className="font-semibold">Profile</div>
+                <div className="opacity-70" style={{ color: t.sub }}>
+                  Dial Pay Mini App
+                </div>
+              </div>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                onClick={onFund}
+                className="px-2.5 py-1 rounded-lg text-xs font-bold text-white"
+                style={{ background: t.accent2 }}
+              >
+                Add funds
+              </button>
               {authenticated ? (
-                <>
-                  {user?.email?.address && (
-                    <span className="text-xs opacity-70">{user.email.address}</span>
-                  )}
-                  <button
-                    onClick={() => logout()}
-                    className="px-2.5 py-1 rounded-lg text-xs font-bold text-white"
-                    style={{ background: t.accent2 }}
-                  >
-                    Sign out
-                  </button>
-                </>
+                <button
+                  onClick={() => logout()}
+                  className="px-2.5 py-1 rounded-lg text-xs font-bold text-white"
+                  style={{ background: "#1f2937" }}
+                >
+                  Sign out
+                </button>
               ) : (
                 <button
                   onClick={() => login()}
@@ -194,21 +260,27 @@ export default function Home() {
           {payee ? (
             <p className="mt-1 text-xs opacity-70">
               Receiving to: {payee.slice(0, 6)}…{payee.slice(-4)}
-              <button
-                onClick={onFund}
-                className="ml-2 px-2 py-0.5 rounded-md text-[10px] font-bold text-white"
-                style={{ background: t.accent1 }}
-              >
-                Add funds
-              </button>
             </p>
           ) : null}
         </header>
 
-        <section className="mb-4 text-center">
-          <div className="text-6xl font-black tracking-tight select-none">
+        <section className="flex flex-col items-center text-center select-none">
+          <Image
+            src="/phone.logo.no.bg.png"
+            alt="Dial"
+            width={170}
+            height={170}
+            priority
+            className="drop-shadow-[0_10px_40px_rgba(124,58,237,.35)]"
+          />
+
+          <div className="text-[40px] sm:text-[56px] leading-none font-black tracking-tight mt-2">
             ${amount}
           </div>
+          <p className="text-sm mt-2" style={{ color: t.sub }}>
+            Request or send payments instantly in Telegram
+          </p>
+
           <div className="flex justify-center gap-3 mt-3">
             <button
               onClick={() => bump(-1)}
@@ -232,11 +304,11 @@ export default function Home() {
           placeholder="Add note (optional)"
           value={note}
           onChange={(e) => setNote(e.target.value)}
-          className="w-full p-3 rounded-xl mb-4 bg-black/30 outline-none"
-          style={{ border: "1px solid #2a2142", color: t.text }}
+          className="w-full p-3 rounded-xl mt-3 bg-black/30 outline-none"
+          style={{ border: "1px solid #163a29", color: t.text }}
         />
 
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-3 mt-3">
           <button
             disabled={loading}
             onClick={() => create("request")}
@@ -254,6 +326,54 @@ export default function Home() {
             Send
           </button>
         </div>
+        </div>
+
+        <BottomNav className="mt-2 shrink-0" />
+
+        {onrampUrl ? (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70"
+            role="dialog"
+            aria-modal="true"
+          >
+            <div className="w-[92vw] max-w-xl h-[80vh] bg-black rounded-2xl overflow-hidden border" style={{ borderColor: '#163a29' }}>
+              <div className="flex items-center justify-between px-3 py-2 text-xs" style={{ color: t.sub, background: '#0b1610' }}>
+                <span>Secure funding</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      const url = onrampUrl;
+                      if (!url) return;
+                      const tg = (tgRef as any)?.current;
+                      if (tg?.openLink && typeof tg.openLink === 'function') {
+                        try { tg.openLink(url); return; } catch {}
+                      }
+                      window.open(url, '_blank');
+                    }}
+                    className="px-2 py-1 rounded-md font-semibold"
+                    style={{ background: '#12331f', color: t.text }}
+                  >
+                    Open in browser
+                  </button>
+                  <button
+                    onClick={() => setOnrampUrl(null)}
+                    className="px-2 py-1 rounded-md font-semibold"
+                    style={{ background: '#1f2937', color: t.text }}
+                  >
+                    Close
+                  </button>
+                </div>
+              </div>
+              <iframe
+                key={onrampUrl}
+                src={onrampUrl}
+                title="Onramp"
+                className="w-full h-full"
+                allow="accelerometer; autoplay; camera; gyroscope; payment *; clipboard-write; encrypted-media"
+              />
+            </div>
+          </div>
+        ) : null}
       </div>
     </main>
   );

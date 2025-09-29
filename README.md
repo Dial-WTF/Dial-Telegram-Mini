@@ -21,6 +21,17 @@ ALLOW_UNVERIFIED_INITDATA=1  # dev bypass; omit in prod
 PAYEE_ADDR=                  # your org/payee EVM address
 FEE_ADDR=                    # optional; defaults to PAYEE_ADDR
 NEXT_PUBLIC_PRIVY_APP_ID=    # Privy App ID
+NEXT_PUBLIC_ONRAMP=COINBASE  # or MOONPAY
+NEXT_PUBLIC_COINBASE_APP_ID= # Coinbase Onramp App ID (NOT API key)
+COINBASE_DEFAULT_ASSET=USDC
+COINBASE_DEFAULT_FIAT=USD
+COINBASE_DEFAULT_FIAT_AMOUNT=20
+# If your Coinbase Onramp app requires a session token, set this (temporary dev only):
+# COINBASE_SESSION_TOKEN=    # server-generated session token per Coinbase docs
+NEXT_PUBLIC_MOONPAY_KEY=     # MoonPay public key (if using MOONPAY)
+MOONPAY_SECRET_KEY=          # MoonPay secret for URL signature
+MOONPAY_DEFAULT_CURRENCY_CODE=usdc
+MOONPAY_DEFAULT_BASE_CURRENCY=usd
 ```
 
 ### Dev setup
@@ -45,6 +56,15 @@ npx ngrok http 3000
 - `/api/status` (GET)
   - `?id=<requestId>` → rehydrates the request and returns `{ status: 'pending'|'paid', balance }`
 
+- `/api/onramp/coinbase` (GET)
+  - Redirects to Coinbase Hosted Onramp: `https://pay.coinbase.com/buy`
+  - Params: `appId`, optional `addresses=[{address,blockchains:['base']}]`, `amount`, `fiatCurrency`, optional `assets` (USDC/ETH/...)
+  - If your Onramp app enforces secure initialization, a `sessionToken` is required. Provide `COINBASE_SESSION_TOKEN` (dev) or implement a server endpoint to mint tokens per Coinbase [security requirements](https://docs.cdp.coinbase.com/onramp-&-offramp/security-requirements).
+
+- `/api/onramp/moonpay` (GET)
+  - Redirects to MoonPay `https://buy.moonpay.com` with a signed query
+  - Requires `NEXT_PUBLIC_MOONPAY_KEY` and `MOONPAY_SECRET_KEY`
+
 All API routes export `runtime = 'nodejs'` to avoid Edge limitations.
 
 ### Client behavior
@@ -52,6 +72,11 @@ All API routes export `runtime = 'nodejs'` to avoid Edge limitations.
 - Privy `ensureWallet()` prompts login if not authenticated, then reads `wallets[0].address`
 - POST to `/api/invoice` with `{ kind, amount:Number, note, initData, payee }`
 - On success, opens `payUrl` inside Telegram webview
+
+Funding (Add funds)
+- Tries Privy `fundWallet` with `card.preferredProvider` from `NEXT_PUBLIC_ONRAMP`
+- If the widget fails in Telegram IAB, we auto-fallback to an iframe overlay and an “Open in browser” button
+- Known limitation: many onramps restrict flows inside Telegram’s webview; “Open in browser” is the reliable path
 
 ### cURL sanity
 ```bash
@@ -66,3 +91,96 @@ curl "$PUBLIC_BASE_URL/api/status?id=<requestId>"
 - Set the same env vars (omit `ALLOW_UNVERIFIED_INITDATA`)
 - Update BotFather Web App URL to the prod domain
 - Test from phone; `/api/invoice` must validate Telegram `initData`
+
+### WIP: Coinbase Onramp session token
+- If you see a Coinbase page saying "Missing or invalid parameters: requires sessionToken" your Onramp app is configured to require secure initialization.
+- For dev:
+  - Option A: Temporarily disable session token requirement in the Coinbase portal
+  - Option B: Provide `COINBASE_SESSION_TOKEN` (server-generated) and restart
+- For prod:
+  - Implement a backend endpoint to mint session tokens after authenticating the user (see Coinbase docs) and pass it through the `/api/onramp/coinbase` redirect.
+
+### Domain whitelisting and bot linkage (Important for dev tunnels)
+Many providers block unknown origins and IAB contexts. Any time your ngrok URL changes, update all allowlists:
+
+- Privy (Allowed origins)
+- Coinbase Onramp (Allowed origins / app settings)
+- MoonPay (Allowed origins)
+- Google OAuth (Authorized JavaScript origins and redirect URIs)
+- Telegram (Bot Web App URL)
+
+Recommended: Always use HTTPS ngrok domain (e.g., `https://dial.ngrok.app`). If the subdomain rotates, revisit each dashboard and re-add it.
+
+#### Telegram bots ↔ domains (local vs prod)
+All bots are owned by Adam. Current linkage:
+
+- Dial Betabot → `https://dev.tgbot.dial.wtf` (development)
+- Alpha Dialbot → `https://dial.ngrok.app` (local dev tunnel)
+- Dial Official Bot → `https://tgbot.dial.wtf` (production)
+- Dial WTF Bot → `https://tgbot.dial.wtf` (production)
+
+Each bot has its own token and must be configured with the correct Web App URL and webhook.
+
+#### Webhook and env sync
+Use `scripts/sync-env-and-webhook.sh` to push env vars to Vercel and set the webhook for the current `.env.local`:
+
+```bash
+scripts/sync-env-and-webhook.sh development .env.local
+# or preview/production
+```
+
+Env must include:
+- `PUBLIC_BASE_URL` (matches the bot’s Web App URL)
+- `BOT_TOKEN` (for the specific bot you’re linking)
+
+This script sets the webhook to `${PUBLIC_BASE_URL}/api/bot` for the provided `BOT_TOKEN`.
+
+### Telegram bots: multi-bot setup
+Each bot must have its own webhook and (optionally) commands and inline mode.
+
+Per-bot env file (example `.env.alpha`):
+
+```
+PUBLIC_BASE_URL=https://dial.ngrok.app
+BOT_TOKEN=123456:ABCDEF
+```
+
+Set webhook and verify:
+
+```bash
+scripts/set-bot-webhook.sh "$BOT_TOKEN" "$PUBLIC_BASE_URL"
+# or
+scripts/sync-env-and-webhook.sh development .env.alpha
+```
+
+Set commands (private chats or group scope):
+
+```bash
+scripts/set-bot-commands.sh "$BOT_TOKEN" all_private_chats
+scripts/set-bot-commands.sh "$BOT_TOKEN" all_group_chats
+```
+
+Enable inline mode (BotFather): see `scripts/enable-inline-mode.md`.
+
+Notes:
+- Any time your domain/tunnel changes, re-run the webhook script for each bot.
+- Group privacy mode affects non-command messages; keep it ON and use slash commands, or OFF if you want the bot to read all messages.
+
+### Telegram Mate (deployment helper)
+We use `@telegram-apps/mate` to upload static assets to Telegram Mini Apps CDN.
+
+Install & usage (via pnpm dlx):
+
+```bash
+# Print CDN base path for a project name
+pnpm dlx @telegram-apps/mate@latest deploy info --project dial-telegram-mini
+
+# Upload a directory (e.g., public/) to CDN under the project name
+pnpm dlx @telegram-apps/mate@latest deploy upload --project dial-telegram-mini --dir ./public
+```
+
+Notes:
+- The base path from `deploy info` is used by Telegram as the root for uploaded files for the given project.
+- Re-run `upload` when you change static files used by your Mini App (icons, images, etc.).
+- You can parameterize the project name per environment, e.g., `dial-telegram-mini-dev` vs `dial-telegram-mini-prod`.
+
