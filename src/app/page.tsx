@@ -5,16 +5,16 @@ import Image from "next/image";
 import { usePrivy, useWallets, useFundWallet } from "@privy-io/react-auth"; // embedded wallet & funding
 import BottomNav from "@/components/BottomNav";
 
-// Dial theme tokens
+// Dial retro neon theme (purple)
 const t = {
-  bg: "radial-gradient(80% 60% at 50% 0%, #0d1f14 0%, #08110c 40%, #050708 100%)",
-  card: "#0f1a12",
-  text: "#E7F8EC",
-  sub: "#B5E1C2",
-  accent1: "#16A34A", // green
-  accent2: "#059669", // teal
-  glow: "0 10px 40px rgba(5, 150, 105, .25)",
-  border: "1px solid rgba(22,163,74,.35)",
+  bg: "radial-gradient(80% 60% at 50% 0%, #0b0713 0%, #0a0612 40%, #07040e 100%)",
+  card: "#141021",
+  text: "#EDE9FE",
+  sub: "#B8A6F8",
+  accent1: "#7C3AED", // purple
+  accent2: "#C026D3", // fuchsia
+  glow: "0 10px 40px rgba(124,58,237,.25)",
+  border: "1px solid rgba(124,58,237,.35)",
 };
 
 type Kind = "request" | "send";
@@ -219,7 +219,7 @@ export default function Home() {
             <div className="flex items-center gap-3">
               <div
                 className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
-                style={{ background: "#12331f", color: t.text, border: t.border }}
+                style={{ background: "#2b1b4b", color: t.text, border: t.border }}
               >
                 {(user?.email?.address?.[0] || "D").toUpperCase()}
               </div>
@@ -271,7 +271,7 @@ export default function Home() {
             width={170}
             height={170}
             priority
-            className="drop-shadow-[0_10px_40px_rgba(5,150,105,.25)]"
+            className="drop-shadow-[0_10px_40px_rgba(124,58,237,.35)]"
           />
 
           <div className="text-[40px] sm:text-[56px] leading-none font-black tracking-tight mt-2">

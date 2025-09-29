@@ -135,3 +135,52 @@ Env must include:
 
 This script sets the webhook to `${PUBLIC_BASE_URL}/api/bot` for the provided `BOT_TOKEN`.
 
+### Telegram bots: multi-bot setup
+Each bot must have its own webhook and (optionally) commands and inline mode.
+
+Per-bot env file (example `.env.alpha`):
+
+```
+PUBLIC_BASE_URL=https://dial.ngrok.app
+BOT_TOKEN=123456:ABCDEF
+```
+
+Set webhook and verify:
+
+```bash
+scripts/set-bot-webhook.sh "$BOT_TOKEN" "$PUBLIC_BASE_URL"
+# or
+scripts/sync-env-and-webhook.sh development .env.alpha
+```
+
+Set commands (private chats or group scope):
+
+```bash
+scripts/set-bot-commands.sh "$BOT_TOKEN" all_private_chats
+scripts/set-bot-commands.sh "$BOT_TOKEN" all_group_chats
+```
+
+Enable inline mode (BotFather): see `scripts/enable-inline-mode.md`.
+
+Notes:
+- Any time your domain/tunnel changes, re-run the webhook script for each bot.
+- Group privacy mode affects non-command messages; keep it ON and use slash commands, or OFF if you want the bot to read all messages.
+
+### Telegram Mate (deployment helper)
+We use `@telegram-apps/mate` to upload static assets to Telegram Mini Apps CDN.
+
+Install & usage (via pnpm dlx):
+
+```bash
+# Print CDN base path for a project name
+pnpm dlx @telegram-apps/mate@latest deploy info --project dial-telegram-mini
+
+# Upload a directory (e.g., public/) to CDN under the project name
+pnpm dlx @telegram-apps/mate@latest deploy upload --project dial-telegram-mini --dir ./public
+```
+
+Notes:
+- The base path from `deploy info` is used by Telegram as the root for uploaded files for the given project.
+- Re-run `upload` when you change static files used by your Mini App (icons, images, etc.).
+- You can parameterize the project name per environment, e.g., `dial-telegram-mini-dev` vs `dial-telegram-mini-prod`.
+

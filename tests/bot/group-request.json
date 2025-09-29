@@ -1,0 +1,10 @@
+{
+  "update_id": 1000002,
+  "message": {
+    "message_id": 20,
+    "from": { "id": 777002, "is_bot": false, "first_name": "Tester" },
+    "chat": { "id": -1001234567890, "type": "supergroup", "title": "Dial Test" },
+    "date": 1710000050,
+    "text": "/request@AlphaDialBot 5 pizza 0xdial.eth"
+  }
+}
