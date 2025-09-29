@@ -16,9 +16,16 @@ fi
 case "$SCOPE" in
   default|all_private_chats|all_group_chats) ;;
   *) echo "Invalid scope: $SCOPE" >&2; exit 1;;
-fi
+esac
 
-COMMANDS='[{"command":"start","description":"Start bot"},{"command":"request","description":"Create an invoice: /request <amount> [note] [destination]"},{"command":"pay","description":"Send native: /pay <to> <amount>"}]'
+COMMANDS='[
+  {"command":"start","description":"Start bot"},
+  {"command":"request","description":"Create an invoice: /request <amount> [note] [destination]"},
+  {"command":"pay","description":"Send native: /pay <to> <amount>"},
+  {"command":"startparty","description":"Create a party room"},
+  {"command":"listparty","description":"List open party rooms"},
+  {"command":"findparty","description":"Find party by contract address"}
+]'
 
 DATA="{\"commands\":$COMMANDS,\"scope\":{\"type\":\"${SCOPE}\"}}"
 
