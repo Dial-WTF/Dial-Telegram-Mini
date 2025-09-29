@@ -21,8 +21,10 @@
     "@twa-dev/sdk": "^8.0.2",
     "ethers": "^6.15.0",
     "next": "15.5.4",
+    "qrcode": "^1.5.4",
     "react": "19.1.0",
     "react-dom": "19.1.0",
+    "sharp": "^0.34.4",
     "viem": "^2.37.9"
   },
   "devDependencies": {

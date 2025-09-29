@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { appConfig } from '@/lib/config';
-import { parseEther } from 'ethers';
+import { parseEther, Interface } from 'ethers';
 import { parseRequest } from '@/lib/parse';
 import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '@/lib/addr';
 import { tg } from '@/lib/telegram';
@@ -145,19 +145,24 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true });
       }
       try {
-        const rawBase = process.env.REQUEST_BASE_URL || process.env.REQUEST_REST_BASE || 'https://api.request.network';
+        const rawBase = (appConfig.request.restBase || 'https://api.request.network');
         const baseTrim = rawBase.replace(/\/$/, '');
         const endpoint = /\/v1$/.test(baseTrim)
           ? `${baseTrim}/request`
           : /\/v2$/.test(baseTrim)
           ? `${baseTrim}/request`
           : `${baseTrim}/v2/request`;
+        const apiKey = appConfig.request.apiKey || process.env.REQUEST_API_KEY;
+        if (!apiKey) {
+          await reply('Server missing REQUEST_API_KEY');
+          return NextResponse.json({ ok: false }, { status: 200 });
+        }
         const rest = await fetch(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            ...(process.env.REQUEST_API_KEY ? { 'X-Api-Key': process.env.REQUEST_API_KEY as string, 'x-api-key': process.env.REQUEST_API_KEY as string } : {}),
+            'x-api-key': apiKey as string,
           },
           body: JSON.stringify({
             payee: addr,
@@ -224,13 +229,18 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        const rawBase = process.env.REQUEST_BASE_URL || process.env.REQUEST_REST_BASE || 'https://api.request.network';
+        const rawBase = (appConfig.request.restBase || 'https://api.request.network');
         const baseTrim = rawBase.replace(/\/$/, '');
         const endpoint = /\/v1$/.test(baseTrim)
           ? `${baseTrim}/request`
           : /\/v2$/.test(baseTrim)
           ? `${baseTrim}/request`
           : `${baseTrim}/v2/request`;
+        const apiKey = appConfig.request.apiKey || process.env.REQUEST_API_KEY;
+        if (!apiKey) {
+          await reply('Server missing REQUEST_API_KEY');
+          return NextResponse.json({ ok: false }, { status: 200 });
+        }
         // Resolve payee: explicit destination > linked wallet > env fallback
         let payee: string | undefined;
         if (explicitDest) {
@@ -270,7 +280,7 @@ export async function POST(req: NextRequest) {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json', 'Accept': 'application/json',
-            ...(process.env.REQUEST_API_KEY ? { 'X-Api-Key': process.env.REQUEST_API_KEY as string, 'x-api-key': process.env.REQUEST_API_KEY as string } : {}),
+            'x-api-key': apiKey as string,
           },
           body: JSON.stringify({
             payee,
@@ -302,7 +312,8 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true, error: t });
         }
         const json = await rest.json();
-        const id = json.paymentReference || json.requestID || json.requestId;
+        const id = json.requestID || json.requestId || json.id;
+        const paymentReference: string | undefined = json.paymentReference || json.reference || json.payment_reference;
         if (!id) {
           await reply('Invoice created but id missing');
           return NextResponse.json({ ok: true });
@@ -310,10 +321,39 @@ export async function POST(req: NextRequest) {
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const payUrl = `${baseUrl}/pay/${id}`;
 
-        // Send inline QR with an Open button that uses web_app
-        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(payUrl)}`;
+        // Build an EIP-681 ETH URI to the ETH Fee Proxy if configured
+        const amountWei = parseEther(String(amt));
+        const feeBps = Number(process.env.FEE_BPS || '50');
+        const feeWei = (amountWei * BigInt(feeBps)) / 10000n;
+        const feeAddr = process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!;
+        const proxy = process.env.ETH_FEE_PROXY_ADDRESS; // set this for mainnet to get wallet-pay QR
+
+        let ethUri: string | undefined;
+        if (proxy && paymentReference) {
+          try {
+            const iface = new Interface([
+              'function transferWithReferenceAndFee(address to, bytes reference, uint256 fee, address feeAddress)'
+            ]);
+            const data = iface.encodeFunctionData('transferWithReferenceAndFee', [payee, paymentReference, feeWei, feeAddr]);
+            ethUri = `ethereum:${proxy}?value=${amountWei.toString()}&data=${data}`;
+          } catch {}
+        }
+        // Fallback: simple ETH transfer URI to payee if proxy/reference not available
+        if (!ethUri && payee) {
+          ethUri = `ethereum:${payee}?value=${amountWei.toString()}`;
+        }
+        const base = appConfig.publicBaseUrl || '';
+        const scanUrl = `https://scan.request.network/request/${id}`;
+        const qrPayload = ethUri || payUrl; // prefer wallet-pay if available, otherwise app link
+        const qrApi = `${baseUrl.replace(/\/$/, '')}/api/qr`;
+        const qrUrl = `${qrApi}?size=720&data=${encodeURIComponent(qrPayload)}&logo=/phone-logo-no-bg.png&bg=%23F8F6FF&grad1=%237C3AED&grad2=%23C026D3&footerH=180&wordmark=/Dial.letters.transparent.bg.crop.png`;
         const caption = `Request: $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`;
-        const keyboard = { inline_keyboard: [[{ text: 'Open invoice', web_app: { url: payUrl } }]] } as any;
+        // Buttons: Only https URLs (Telegram rejects ethereum: links in buttons)
+        const topRow: any[] = [{ text: 'Open invoice', url: payUrl }];
+        if (ethUri) topRow.push({ text: 'Pay in wallet', url: `${baseUrl.replace(/\/$/, '')}/paylink?uri=${encodeURIComponent(ethUri)}` });
+        const scanRow: any[] = [{ text: 'View on Request Scan', url: scanUrl }];
+        const statusRow: any[] = [{ text: 'Status: Pending', callback_data: 'status_pending', sticker: 'ABCEmoji' }];
+        const keyboard = { inline_keyboard: [topRow, scanRow, statusRow] } as any;
         const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
 
         // Poll and update caption to ✅ PAID

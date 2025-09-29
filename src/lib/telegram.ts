@@ -18,7 +18,8 @@ async function call(method: string, payload: any): Promise<any> {
 }
 
 export const tg = {
-  sendMessage: (chat_id: number | string, text: string) => call('sendMessage', { chat_id, text }),
+  sendMessage: (chat_id: number | string, text: string, reply_markup?: any) =>
+    call('sendMessage', { chat_id, text, ...(reply_markup ? { reply_markup } : {}) }),
   sendPhoto: (chat_id: number | string, photo: string, caption?: string, reply_markup?: any) =>
     call('sendPhoto', { chat_id, photo, ...(caption ? { caption } : {}), ...(reply_markup ? { reply_markup } : {}) }),
   editCaption: (chat_id: number | string, message_id: number, caption: string, reply_markup?: any) =>
