@@ -209,7 +209,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    if (/^\/start/.test(text)) {
+    if (/^\/start\b/.test(text)) {
       await reply('Dial Bot ready. Use /pay <to> <amt> or /request <amt>\n\nParty Lines:\n/startparty - Create a party room\n/listparty - List open party rooms\n/findparty <address> - Find party by contract address');
       return NextResponse.json({ ok: true });
     }
@@ -224,20 +224,31 @@ export async function POST(req: NextRequest) {
 
       // Get user's wallet address
       let owner: string | undefined;
-      try {
-        const privy = await getPrivyClient();
-        if (privy) {
-          const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
-          const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
-          const addr = (w as any)?.address as string | undefined;
-          if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) owner = addr;
+      const parts = text.split(/\s+/);
+      const providedAddr = parts[1];
+
+      // If user provided an address, use that
+      if (providedAddr && /^0x[0-9a-fA-F]{40}$/i.test(providedAddr)) {
+        owner = providedAddr.toLowerCase();
+      } else {
+        // Try to get from Privy
+        try {
+          const privy = await getPrivyClient();
+          if (privy) {
+            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            const addr = (w as any)?.address as string | undefined;
+            if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) owner = addr;
+          }
+        } catch (err: any) {
+          if (DEBUG) {
+            await reply(`dbg: Privy lookup failed: ${err?.message || 'unknown'}`);
+          }
         }
-      } catch {}
+      }
 
       if (!owner) {
-        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const keyboard = { inline_keyboard: [[{ text: 'Link wallet', web_app: { url: baseUrl } }]] } as any;
-        await tgCall('sendMessage', { chat_id: chatId, text: 'No wallet linked. Open the app and sign in first to create a party room.', reply_markup: keyboard });
+        await reply('No wallet found. Usage: /startparty <your_wallet_address>\n\nExample: /startparty 0xaA64...337c');
         return NextResponse.json({ ok: true });
       }
 
@@ -261,10 +272,31 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: false, error });
         }
 
-        const data = await response.json();
-        const partyLineUrl = `https://staging.dial.wtf/party/${data.id || data.contractAddress || ''}`;
-        await reply(`🎉 Party room created!\n\nOwner: ${owner}\n${data.contractAddress ? `Contract: ${data.contractAddress}\n` : ''}${data.id ? `View: ${partyLineUrl}` : ''}`);
-        return NextResponse.json({ ok: true, data });
+        const apiResponse = await response.json();
+        if (DEBUG) {
+          await reply(`dbg: API response: ${JSON.stringify(apiResponse)}`);
+        }
+
+        const data = apiResponse.data || apiResponse;
+        const joinUrl = data.joinUrl;
+        const roomCode = data.roomCode;
+        const partyId = data.id || data.partyLineId || data.contractAddress || data.address;
+
+        if (!joinUrl && !partyId) {
+          await reply(`⚠️ Party room created but no ID or joinUrl returned.`);
+          return NextResponse.json({ ok: true, data: apiResponse });
+        }
+
+        // Replace dial.wtf with staging.dial.wtf in joinUrl
+        const partyLineUrl = joinUrl
+          ? joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/')
+          : `https://staging.dial.wtf/party/${roomCode || partyId}`;
+        const message = `🎉 Party room created!\n\nOwner: ${owner}\nRoom Code: ${roomCode || 'N/A'}`;
+        const keyboard = {
+          inline_keyboard: [[{ text: 'Open Party Room', url: partyLineUrl }]]
+        };
+        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        return NextResponse.json({ ok: true, data: apiResponse });
       } catch (err: any) {
         await reply(`Error creating party room: ${err?.message || 'unknown'}`);
         return NextResponse.json({ ok: false });
@@ -280,7 +312,8 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines', {
+        // Query all party lines (not just active ones)
+        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines?limit=100', {
           method: 'GET',
           headers: {
             'x-api-key': apiKey,
@@ -293,8 +326,19 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: false, error });
         }
 
-        const data = await response.json();
-        const partyLines = Array.isArray(data) ? data : data.partyLines || [];
+        const apiResponse = await response.json();
+
+        if (DEBUG) {
+          const shortResp = JSON.stringify(apiResponse).slice(0, 500);
+          await reply(`dbg: Raw response: ${shortResp}`);
+        }
+
+        // API returns: { success: true, data: { partyLines: [...], pagination: {...} } }
+        const partyLines = apiResponse?.data?.partyLines || [];
+
+        if (DEBUG) {
+          await reply(`dbg: Found ${partyLines.length} party rooms`);
+        }
 
         if (partyLines.length === 0) {
           await reply('No open party rooms found. Use /startparty to create one!');
@@ -303,10 +347,10 @@ export async function POST(req: NextRequest) {
 
         let message = `🎊 Open Party Rooms (${partyLines.length}):\n\n`;
         partyLines.slice(0, 10).forEach((party: any, idx: number) => {
-          const contractAddr = party.contractAddress || party.address || 'N/A';
+          const roomCode = party.roomCode || 'N/A';
           const owner = party.owner || 'Unknown';
-          const status = party.status || 'active';
-          message += `${idx + 1}. ${contractAddr.slice(0, 10)}...\n   Owner: ${owner.slice(0, 10)}...\n   Status: ${status}\n\n`;
+          const joinUrl = party.joinUrl ? party.joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/') : '';
+          message += `${idx + 1}. ${roomCode}\n   Owner: ${owner.slice(0, 10)}...${owner.slice(-6)}\n   ${joinUrl}\n\n`;
         });
 
         if (partyLines.length > 10) {
