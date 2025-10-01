@@ -4,6 +4,13 @@ import { parseEther, Interface } from 'ethers';
 import { parseRequest } from '@/lib/parse';
 import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '@/lib/addr';
 import { tg } from '@/lib/telegram';
+import { fetchPayCalldata } from '@/lib/requestApi';
+import { bpsToPercentString } from '@/lib/fees';
+import { buildEthereumUri, decodeProxyDataAndValidateValue } from '@/lib/ethUri';
+import { estimateGasAndPrice } from '@/lib/gas';
+import { buildQrForRequest } from '@/lib/qrUi';
+import { isValidEthereumAddress } from '@/lib/utils';
+import { requestContextById } from '@/lib/mem';
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
 const pendingAddressByUser = new Map<number, { amount: number; note: string }>();
@@ -145,47 +152,20 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true });
       }
       try {
-        const rawBase = (appConfig.request.restBase || 'https://api.request.network');
-        const baseTrim = rawBase.replace(/\/$/, '');
-        const endpoint = /\/v1$/.test(baseTrim)
-          ? `${baseTrim}/request`
-          : /\/v2$/.test(baseTrim)
-          ? `${baseTrim}/request`
-          : `${baseTrim}/v2/request`;
-        const apiKey = appConfig.request.apiKey || process.env.REQUEST_API_KEY;
-        if (!apiKey) {
-          await reply('Server missing REQUEST_API_KEY');
-          return NextResponse.json({ ok: false }, { status: 200 });
-        }
-        const rest = await fetch(endpoint, {
+        const apiBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const rest = await fetch(`${apiBase}/api/invoice`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'x-api-key': apiKey as string,
+            'x-internal': process.env.INTERNAL_API_KEY || '',
           },
           body: JSON.stringify({
             payee: addr,
-            amount: String(ctx.amount),
-            invoiceCurrency: 'ETH-mainnet',
-            paymentCurrency: 'ETH-mainnet',
-            reference: ctx.note || '',
-            paymentNetwork: {
-              id: 'ETH_FEE_PROXY_CONTRACT',
-              parameters: {
-                paymentNetworkName: 'mainnet',
-                paymentAddress: addr,
-                feeAddress: process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!,
-                feeAmount: (() => {
-                  try {
-                    const bps = Number(process.env.FEE_BPS || '50');
-                    const wei = parseEther(String(ctx.amount));
-                    const fee = (wei * BigInt(bps)) / 10000n;
-                    return fee.toString();
-                  } catch { return '0'; }
-                })()
-              }
-            }
+            amount: Number(ctx.amount),
+            note: ctx.note || '',
+            kind: 'request',
+            initData: '',
           }),
         });
         if (!rest.ok) {
@@ -197,11 +177,11 @@ export async function POST(req: NextRequest) {
         const json = await rest.json();
         const id = json.paymentReference || json.requestID || json.requestId;
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const payUrl = `${baseUrl}/pay/${id}`;
-        const keyboard = { inline_keyboard: [[{ text: 'Open', web_app: { url: payUrl } }]] } as any;
+        const openUrl = `${baseUrl}/pay/${id}`;
+        const keyboard = { inline_keyboard: [[{ text: 'Open', web_app: { url: openUrl } }]] } as any;
         await tg.sendMessage(chatId, `Request: $${ctx.amount.toFixed(2)}${ctx.note ? ` — ${ctx.note}` : ''}`,);
         pendingAddressByUser.delete(tgUserId);
-        return NextResponse.json({ ok: true, id, payUrl });
+        return NextResponse.json({ ok: true, id, payUrl: openUrl });
       } catch (err: any) {
         await reply(`Error creating request: ${err?.message || 'unknown'}`);
         pendingAddressByUser.delete(tgUserId);
@@ -666,18 +646,7 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        const rawBase = (appConfig.request.restBase || 'https://api.request.network');
-        const baseTrim = rawBase.replace(/\/$/, '');
-        const endpoint = /\/v1$/.test(baseTrim)
-          ? `${baseTrim}/request`
-          : /\/v2$/.test(baseTrim)
-          ? `${baseTrim}/request`
-          : `${baseTrim}/v2/request`;
-        const apiKey = appConfig.request.apiKey || process.env.REQUEST_API_KEY;
-        if (!apiKey) {
-          await reply('Server missing REQUEST_API_KEY');
-          return NextResponse.json({ ok: false }, { status: 200 });
-        }
+        const apiBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         // Resolve payee: explicit destination > linked wallet > env fallback
         let payee: string | undefined;
         if (explicitDest) {
@@ -691,13 +660,13 @@ export async function POST(req: NextRequest) {
               const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
               const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
               const addr = (w as any)?.address as string | undefined;
-              if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) payee = addr;
+              if (addr && isValidEthereumAddress(addr)) payee = addr;
               else if ((w as any)?.id) {
                 try {
                   const walletId = (w as any).id as string;
                   const details = await (privy as any).wallets().ethereum().get(walletId);
                   const a = details?.address as string | undefined;
-                  if (a && /^0x[0-9a-fA-F]{40}$/.test(a)) payee = a;
+                  if (a && isValidEthereumAddress(a)) payee = a;
                 } catch {}
               }
             }
@@ -713,34 +682,18 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true });
         }
 
-        const rest = await fetch(endpoint, {
+        const rest = await fetch(`${apiBase}/api/invoice`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json', 'Accept': 'application/json',
-            'x-api-key': apiKey as string,
+            'x-internal': process.env.INTERNAL_API_KEY || '',
           },
           body: JSON.stringify({
             payee,
-            amount: String(amt),
-            invoiceCurrency: 'ETH-mainnet',
-            paymentCurrency: 'ETH-mainnet',
-            reference: note || '',
-            paymentNetwork: {
-              id: 'ETH_FEE_PROXY_CONTRACT',
-              parameters: {
-                paymentNetworkName: 'mainnet',
-                paymentAddress: payee,
-                feeAddress: process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!,
-                feeAmount: (() => {
-                  try {
-                    const bps = Number(process.env.FEE_BPS || '50');
-                    const wei = parseEther(String(amt));
-                    const fee = (wei * BigInt(bps)) / 10000n;
-                    return fee.toString();
-                  } catch { return '0'; }
-                })()
-              }
-            }
+            amount: Number(amt),
+            note,
+            kind: 'request',
+            initData: '',
           }),
         });
         if (!rest.ok) {
@@ -749,68 +702,60 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true, error: t });
         }
         const json = await rest.json();
-        const id = json.requestID || json.requestId || json.id;
-        const paymentReference: string | undefined = json.paymentReference || json.reference || json.payment_reference;
+        const id = json.requestId || json.requestID || json.id;
         if (!id) {
           await reply('Invoice created but id missing');
           return NextResponse.json({ ok: true });
         }
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const payUrl = `${baseUrl}/pay/${id}`;
+        const invUrl = `${baseUrl}/pay/${id}`;
 
-        // Build an EIP-681 ETH URI to the ETH Fee Proxy if configured
-        const amountWei = parseEther(String(amt));
-        const feeBps = Number(process.env.FEE_BPS || '50');
-        const feeWei = (amountWei * BigInt(feeBps)) / 10000n;
-        const feeAddr = process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!;
-        const proxy = process.env.ETH_FEE_PROXY_ADDRESS; // set this for mainnet to get wallet-pay QR
-
+        // Build QR using utils and pay endpoint; fallback to invoice link on any mismatch
         let ethUri: string | undefined;
-        if (proxy && paymentReference) {
+        try {
+          const feeAddress = process.env.FEE_ADDRESS || appConfig.feeAddr || undefined;
+          const feePercentage = feeAddress ? bpsToPercentString(process.env.FEE_BPS || '50') : undefined;
+          const payJson = await fetchPayCalldata(id, { feeAddress, feePercentage, apiKey: appConfig.request.apiKey || process.env.REQUEST_API_KEY });
+          const txs: any[] = Array.isArray((payJson as any)?.transactions) ? (payJson as any).transactions : [];
+          const idx: number = Number.isInteger((payJson as any)?.metadata?.paymentTransactionIndex)
+            ? (payJson as any).metadata.paymentTransactionIndex
+            : 0;
+          const sel = txs[idx] || txs[0];
+          if (sel && typeof sel.to === 'string') {
+            const toAddr: string = sel.to;
+            const data: string | undefined = typeof sel.data === 'string' ? sel.data : undefined;
+            const hexVal: string | undefined = typeof sel.value?.hex === 'string' ? sel.value.hex : undefined;
+            const decVal = (() => { try { return hexVal ? BigInt(hexVal).toString(10) : '0'; } catch { return '0'; } })();
+            let gasDec: string | undefined;
+            let gasPriceDec: string | undefined;
+            if (process.env.QR_INCLUDE_GAS_HINTS === '1') {
+              const est = await estimateGasAndPrice({ rpcUrl: process.env.RPC_URL, to: toAddr, data, valueWeiDec: decVal });
+              gasDec = est.gas; gasPriceDec = est.gasPrice;
+            }
+            ethUri = buildEthereumUri({ to: toAddr, valueWeiDec: decVal, data, chainId: 1, gas: gasDec, gasPrice: gasPriceDec });
+            const check = decodeProxyDataAndValidateValue(data, decVal, amt);
+            if (!check.ok) {
+              if (DEBUG) { try { console.warn('[BOT] Value/fee mismatch; fallback', check); } catch {} }
+              ethUri = undefined;
+            }
+            if (DEBUG && ethUri) { try { console.log('[BOT] built ethUri from pay endpoint:', ethUri); } catch {} }
+          }
+        } catch {}
+        const { qrUrl, caption, keyboard, payUrl: builtPayUrl } = buildQrForRequest(baseUrl, id, ethUri, amt, note || '');
+        const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
+        const messageId = sent?.result?.message_id as number | undefined;
+        if (messageId) {
           try {
-            const iface = new Interface([
-              'function transferWithReferenceAndFee(address to, bytes reference, uint256 fee, address feeAddress)'
-            ]);
-            const data = iface.encodeFunctionData('transferWithReferenceAndFee', [payee, paymentReference, feeWei, feeAddr]);
-            ethUri = `ethereum:${proxy}?value=${amountWei.toString()}&data=${data}`;
+            requestContextById.set(id, {
+              chatId: Number(chatId),
+              messageId: Number(messageId),
+              paidCaption: `✅ PAID — $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`,
+              replyMarkup: keyboard,
+            });
           } catch {}
         }
-        // Fallback: simple ETH transfer URI to payee if proxy/reference not available
-        if (!ethUri && payee) {
-          ethUri = `ethereum:${payee}?value=${amountWei.toString()}`;
-        }
-        const base = appConfig.publicBaseUrl || '';
-        const scanUrl = `https://scan.request.network/request/${id}`;
-        const qrPayload = ethUri || payUrl; // prefer wallet-pay if available, otherwise app link
-        const qrApi = `${baseUrl.replace(/\/$/, '')}/api/qr`;
-        const qrUrl = `${qrApi}?size=720&data=${encodeURIComponent(qrPayload)}&logo=/phone-logo-no-bg.png&bg=%23F8F6FF&grad1=%237C3AED&grad2=%23C026D3&footerH=180&wordmark=/Dial.letters.transparent.bg.crop.png`;
-        const caption = `Request: $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`;
-        // Buttons: Only https URLs (Telegram rejects ethereum: links in buttons)
-        const topRow: any[] = [{ text: 'Open invoice', url: payUrl }];
-        if (ethUri) topRow.push({ text: 'Pay in wallet', url: `${baseUrl.replace(/\/$/, '')}/paylink?uri=${encodeURIComponent(ethUri)}` });
-        const scanRow: any[] = [{ text: 'View on Request Scan', url: scanUrl }];
-        const statusRow: any[] = [{ text: 'Status: Pending', callback_data: 'status_pending', sticker: 'ABCEmoji' }];
-        const keyboard = { inline_keyboard: [topRow, scanRow, statusRow] } as any;
-        const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
 
-        // Poll and update caption to ✅ PAID
-        const messageId = sent?.result?.message_id as number | undefined;
-        (async () => {
-          if (!messageId) return;
-          for (let i = 0; i < 24; i++) {
-            try {
-              await new Promise(r => setTimeout(r, 5000));
-              const s = await fetch(`${baseUrl}/api/status?id=${id}`).then(r => r.json());
-              if (s?.status === 'paid') {
-                const paidCaption = `✅ PAID — $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`;
-                await tg.editCaption(chatId, messageId, paidCaption, keyboard);
-                break;
-              }
-            } catch {}
-          }
-        })();
-
-        return NextResponse.json({ ok: true, id, payUrl });
+        return NextResponse.json({ ok: true, id, payUrl: builtPayUrl || invUrl });
       } catch (err: any) {
         await reply(`Error creating request: ${err?.message || 'unknown'}`);
         return NextResponse.json({ ok: false });
