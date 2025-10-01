@@ -10,10 +10,13 @@ export async function POST(req: NextRequest) {
     const { amount, note, kind, initData, payee } = await req.json();
     const DEBUG_REQ = process.env.DEBUG_REQUEST === '1';
 
-    // Allow browser testing outside Telegram in dev
+    // Allow browser testing outside Telegram in dev, or trusted internal callers (bot)
     const allowBypass = appConfig.allowUnverifiedInitData;
+    const internalHeader = req.headers.get('x-internal');
+    const internalKey = process.env.INTERNAL_API_KEY || '';
+    const isTrustedInternal = internalKey && internalHeader === internalKey;
 
-    if (!allowBypass) {
+    if (!allowBypass && !isTrustedInternal) {
       if (!initData || typeof initData !== "string" || !initData.includes("hash=")) {
         return NextResponse.json(
           { error: "Missing Telegram initData hash. Open via Telegram or set ALLOW_UNVERIFIED_INITDATA=1 in dev." },
@@ -138,18 +141,17 @@ export async function POST(req: NextRequest) {
         },
         timestamp: Math.floor(Date.now() / 1000),
       },
-      // Server "signs" the request creation (identity). Keep this as your payee/org address.
+      // Sign the request as the same address as payee so invoice UI shows the input address
       signer: {
         type: Types.Identity.TYPE.ETHEREUM_ADDRESS,
-        value: appConfig.payeeAddr!,
+        value: resolvedPayee!,
       },
       contentData: { note, kind, brand: "Dial" },
+      // Use non-fee ERC20 proxy for now; later we can enable fee routes
       paymentNetwork: {
-        id: Types.Extension.PAYMENT_NETWORK_ID.ERC20_FEE_PROXY_CONTRACT,
+        id: Types.Extension.PAYMENT_NETWORK_ID.ERC20_PROXY_CONTRACT,
         parameters: {
           paymentNetworkName: chain as any,
-          feeAddress: appConfig.feeAddr || appConfig.payeeAddr!,
-          feeAmount: "0",
           paymentAddress: resolvedPayee!,
         },
       },

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { tg } from '@/lib/telegram';
+import { requestContextById } from '@/lib/mem';
 
 export const runtime = 'nodejs';
 
@@ -17,13 +18,11 @@ export async function POST(req: NextRequest) {
     const eventType: string = body?.event?.type || body?.type || '';
     const data = body?.event?.data || body?.data || body || {};
     const requestId: string | undefined = data?.requestId || data?.id || data?.request?.id;
-    const metadata = data?.metadata || data?.request?.metadata || {};
-
-    // If we stored Telegram context when creating the request, use it here
-    const chatId = metadata?.chatId;
-    const messageId = metadata?.messageId;
-    const caption = metadata?.paidCaption || '✅ PAID';
-    const replyMarkup = metadata?.replyMarkup; // if you persisted the same inline keyboard
+    const ctx = requestContextById.get(requestId || '');
+    const chatId = ctx?.chatId;
+    const messageId = ctx?.messageId;
+    const caption = ctx?.paidCaption || '✅ PAID';
+    const replyMarkup = ctx?.replyMarkup;
 
     // Consider these as "paid" signals; adjust to exact value from your dashboard (e.g., "Payment Confirmed")
     const looksPaid = /paid|payment[_\s-]?confirmed/i.test(eventType);
@@ -35,6 +34,8 @@ export async function POST(req: NextRequest) {
         // Fall through; still return 200 to avoid retries if not desired
         console.error('Failed to edit caption for webhook:', (e as any)?.message || e);
       }
+      // Clear context after success to avoid leaks
+      try { if (requestId) requestContextById.delete(requestId); } catch {}
     }
 
     return NextResponse.json({ ok: true, received: true, event: eventType, requestId });
