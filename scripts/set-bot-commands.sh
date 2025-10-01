@@ -20,11 +20,14 @@ esac
 
 COMMANDS='[
   {"command":"start","description":"Start bot"},
-  {"command":"request","description":"Create an invoice: /request <amount> [note] [destination]"},
-  {"command":"pay","description":"Send native: /pay <to> <amount>"},
+  {"command":"invoice","description":"Create crypto invoice: /invoice <amount> <asset>"},
+  {"command":"send","description":"Send crypto: /send <user> <amount> <asset>"},
+  {"command":"check","description":"Create voucher: /check <amount> <asset>"},
+  {"command":"balance","description":"View wallet balance"},
+  {"command":"request","description":"Create payment request (legacy)"},
   {"command":"startparty","description":"Create a party room"},
   {"command":"listparty","description":"List open party rooms"},
-  {"command":"findparty","description":"Find party by contract address"}
+  {"command":"findparty","description":"Search for party rooms by keyword"}
 ]'
 
 DATA="{\"commands\":$COMMANDS,\"scope\":{\"type\":\"${SCOPE}\"}}"

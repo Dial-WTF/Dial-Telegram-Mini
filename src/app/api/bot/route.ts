@@ -210,7 +210,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (/^\/start\b/.test(text)) {
-      await reply('Dial Bot ready. Use /pay <to> <amt> or /request <amt>\n\nParty Lines:\n/startparty - Create a party room\n/listparty - List open party rooms\n/findparty <address> - Find party by contract address');
+      await reply('💎 Dial Crypto Pay Bot\n\n💰 Payments:\n/invoice <amount> <asset> - Create invoice\n/send <user> <amount> <asset> - Send crypto\n/check <amount> <asset> - Create voucher\n/balance - View balance\n\n🎉 Party Lines:\n/startparty - Create party\n/listparty - List parties\n/findparty <keyword> - Search\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
       return NextResponse.json({ ok: true });
     }
 
@@ -365,13 +365,13 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // /findparty <address> - Search for a party room by contract address
+    // /findparty <keyword> - Search for a party room by keyword (name, room code, owner, or contract address)
     if (/^\/findparty\b/i.test(text)) {
       const parts = text.split(/\s+/);
-      const searchQuery = parts[1];
+      const searchQuery = parts.slice(1).join(' ').trim();
 
       if (!searchQuery) {
-        await reply('Usage: /findparty <contract_address>');
+        await reply('Usage: /findparty <keyword>\n\nSearch by party name, room code, owner address, or contract address');
         return NextResponse.json({ ok: true });
       }
 
@@ -382,7 +382,9 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines', {
+        // Use the API's search parameter for server-side filtering
+        const searchUrl = `https://staging.dial.wtf/api/v1/party-lines?search=${encodeURIComponent(searchQuery)}&isActive=true&limit=50`;
+        const response = await fetch(searchUrl, {
           method: 'GET',
           headers: {
             'x-api-key': apiKey,
@@ -395,38 +397,256 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: false, error });
         }
 
-        const data = await response.json();
-        const partyLines = Array.isArray(data) ? data : data.partyLines || [];
+        const apiResponse = await response.json();
+        const partyLines = apiResponse?.data?.partyLines || [];
 
-        // Search by contract address or partial match
-        const matches = partyLines.filter((party: any) => {
-          const contractAddr = (party.contractAddress || party.address || '').toLowerCase();
-          const search = searchQuery.toLowerCase();
-          return contractAddr.includes(search) || contractAddr === search;
-        });
-
-        if (matches.length === 0) {
-          await reply(`No party rooms found matching: ${searchQuery}`);
+        if (partyLines.length === 0) {
+          await reply(`No party rooms found matching: "${searchQuery}"\n\nTry searching by party name, room code, owner address, or contract address`);
           return NextResponse.json({ ok: true, data: [] });
         }
 
-        let message = `🔍 Found ${matches.length} matching party room${matches.length > 1 ? 's' : ''}:\n\n`;
-        matches.slice(0, 5).forEach((party: any, idx: number) => {
-          const contractAddr = party.contractAddress || party.address || 'N/A';
+        let message = `🔍 Found ${partyLines.length} matching party room${partyLines.length > 1 ? 's' : ''}:\n\n`;
+        partyLines.slice(0, 5).forEach((party: any, idx: number) => {
+          const name = party.name || party.roomCode || 'Unnamed';
+          const roomCode = party.roomCode || 'N/A';
           const owner = party.owner || 'Unknown';
-          const status = party.status || 'active';
-          const partyUrl = `https://staging.dial.wtf/party/${party.id || contractAddr}`;
-          message += `${idx + 1}. ${contractAddr}\n   Owner: ${owner}\n   Status: ${status}\n   URL: ${partyUrl}\n\n`;
+          const contractAddr = party.contractAddress || party.address || 'N/A';
+          const joinUrl = party.joinUrl ? party.joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/') : '';
+          
+          message += `${idx + 1}. ${name}\n`;
+          if (party.name && party.roomCode) message += `   Code: ${roomCode}\n`;
+          message += `   Owner: ${owner.slice(0, 10)}...${owner.slice(-6)}\n`;
+          if (contractAddr !== 'N/A') message += `   Contract: ${contractAddr.slice(0, 10)}...${contractAddr.slice(-6)}\n`;
+          message += `   ${joinUrl}\n\n`;
         });
 
-        if (matches.length > 5) {
-          message += `\n...and ${matches.length - 5} more`;
+        if (partyLines.length > 5) {
+          message += `\n...and ${partyLines.length - 5} more`;
         }
 
         await reply(message);
-        return NextResponse.json({ ok: true, data: matches });
+        return NextResponse.json({ ok: true, data: partyLines });
       } catch (err: any) {
         await reply(`Error searching party rooms: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /invoice <amount> <asset> [description] - Create crypto invoice
+    if (/^\/invoice\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const amount = parseFloat(parts[1] || '0');
+      const asset = (parts[2] || 'USDC').toUpperCase();
+      const description = parts.slice(3).join(' ') || undefined;
+
+      if (!amount || amount <= 0) {
+        await reply('Usage: /invoice <amount> <asset> [description]\n\nExample: /invoice 10 USDC Payment for service\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        return NextResponse.json({ ok: true });
+      }
+
+      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      if (!validAssets.includes(asset)) {
+        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        let payee: string | undefined;
+        try {
+          const privy = await getPrivyClient();
+          if (privy) {
+            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            payee = (w as any)?.address as string | undefined;
+          }
+        } catch {}
+
+        if (!payee) {
+          const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+          await reply('No wallet connected. Open the app to connect your wallet first.');
+          return NextResponse.json({ ok: true });
+        }
+
+        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const res = await fetch(`${baseUrl}/api/crypto/invoice`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            currency_type: 'crypto',
+            asset,
+            amount: String(amount),
+            description,
+            payee,
+            telegram_user_id: tgUserId,
+          }),
+        });
+
+        const data = await res.json();
+        if (!data.ok || !data.result) {
+          await reply(`Failed to create invoice: ${data.error || 'unknown error'}`);
+          return NextResponse.json({ ok: false });
+        }
+
+        const invoice = data.result;
+        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
+        const emoji = assetEmojis[asset] || '💰';
+        const message = `${emoji} Invoice Created\n\nAmount: ${amount} ${asset}\n${description ? `Description: ${description}\n` : ''}Status: Active`;
+        
+        const keyboard = {
+          inline_keyboard: [[
+            { text: 'Pay Invoice', url: invoice.pay_url }
+          ]]
+        };
+
+        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        return NextResponse.json({ ok: true, result: invoice });
+      } catch (err: any) {
+        await reply(`Error creating invoice: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /send <user_id|@username> <amount> <asset> [comment] - Send crypto
+    if (/^\/send\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const userTarget = parts[1];
+      const amount = parseFloat(parts[2] || '0');
+      const asset = (parts[3] || 'USDC').toUpperCase();
+      const comment = parts.slice(4).join(' ') || undefined;
+
+      if (!userTarget || !amount || amount <= 0) {
+        await reply('Usage: /send <user_id|@username> <amount> <asset> [comment]\n\nExample: /send @john 5 USDC Thanks!\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        return NextResponse.json({ ok: true });
+      }
+
+      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      if (!validAssets.includes(asset)) {
+        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        return NextResponse.json({ ok: true });
+      }
+
+      const targetUserId = userTarget.startsWith('@') ? null : parseInt(userTarget);
+      if (!targetUserId && !userTarget.startsWith('@')) {
+        await reply('Invalid user. Use user ID or @username');
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const spendId = `spend_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+        
+        const res = await fetch(`${baseUrl}/api/crypto/transfer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_id: targetUserId || 0,
+            asset,
+            amount: String(amount),
+            spend_id: spendId,
+            comment,
+          }),
+        });
+
+        const data = await res.json();
+        if (!data.ok || !data.result) {
+          await reply(`Failed to send: ${data.error || 'unknown error'}`);
+          return NextResponse.json({ ok: false });
+        }
+
+        const transfer = data.result;
+        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
+        const emoji = assetEmojis[asset] || '💰';
+        await reply(`✅ ${emoji} Sent ${amount} ${asset} to ${userTarget}${comment ? `\n\n"${comment}"` : ''}`);
+        return NextResponse.json({ ok: true, result: transfer });
+      } catch (err: any) {
+        await reply(`Error sending: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /check <amount> <asset> [pin_to_user] - Create crypto voucher
+    if (/^\/check\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const amount = parseFloat(parts[1] || '0');
+      const asset = (parts[2] || 'USDC').toUpperCase();
+      const pinTo = parts[3];
+
+      if (!amount || amount <= 0) {
+        await reply('Usage: /check <amount> <asset> [pin_to_user]\n\nExample: /check 10 USDC @john\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        return NextResponse.json({ ok: true });
+      }
+
+      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      if (!validAssets.includes(asset)) {
+        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const payload: any = { asset, amount: String(amount) };
+        
+        if (pinTo) {
+          if (pinTo.startsWith('@')) {
+            payload.pin_to_username = pinTo.substring(1);
+          } else {
+            payload.pin_to_user_id = parseInt(pinTo);
+          }
+        }
+
+        const res = await fetch(`${baseUrl}/api/crypto/check`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await res.json();
+        if (!data.ok || !data.result) {
+          await reply(`Failed to create check: ${data.error || 'unknown error'}`);
+          return NextResponse.json({ ok: false });
+        }
+
+        const check = data.result;
+        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
+        const emoji = assetEmojis[asset] || '💰';
+        const message = `🎁 ${emoji} Crypto Check Created\n\nAmount: ${amount} ${asset}\n${pinTo ? `Pinned to: ${pinTo}\n` : ''}Status: Active`;
+        
+        const keyboard = {
+          inline_keyboard: [[
+            { text: 'Claim Check', url: check.check_url }
+          ]]
+        };
+
+        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        return NextResponse.json({ ok: true, result: check });
+      } catch (err: any) {
+        await reply(`Error creating check: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /balance - View wallet balance
+    if (/^\/balance\b/i.test(text)) {
+      try {
+        let walletAddr: string | undefined;
+        try {
+          const privy = await getPrivyClient();
+          if (privy) {
+            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            walletAddr = (w as any)?.address as string | undefined;
+          }
+        } catch {}
+
+        if (!walletAddr) {
+          await reply('No wallet connected. Open the app to connect your wallet first.');
+          return NextResponse.json({ ok: true });
+        }
+
+        await reply(`💰 Your Wallet\n\nAddress: ${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}\n\nConnect your wallet in the app to view balances and manage crypto payments.`);
+        return NextResponse.json({ ok: true });
+      } catch (err: any) {
+        await reply(`Error: ${err?.message || 'unknown'}`);
         return NextResponse.json({ ok: false });
       }
     }
