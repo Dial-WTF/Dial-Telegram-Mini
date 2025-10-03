@@ -123,6 +123,96 @@ export async function POST(req: NextRequest) {
       });
       return NextResponse.json({ ok: true });
     }
+
+    // Handle callback queries (inline button presses)
+    const callbackQuery = body?.callback_query;
+    if (callbackQuery) {
+      const callbackData = callbackQuery.data;
+      const callbackChatId = callbackQuery.message?.chat?.id;
+      const callbackUserId = callbackQuery.from?.id;
+      const callbackQueryId = callbackQuery.id;
+      const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+
+      // Answer callback query to remove loading state
+      await tgCall('answerCallbackQuery', { callback_query_id: callbackQueryId });
+
+      if (callbackData === 'quick_invoice') {
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: '💵 5 USDC', callback_data: 'invoice_5_USDC' },
+              { text: '💵 10 USDC', callback_data: 'invoice_10_USDC' }
+            ],
+            [
+              { text: '💵 20 USDC', callback_data: 'invoice_20_USDC' },
+              { text: '💵 50 USDC', callback_data: 'invoice_50_USDC' }
+            ],
+            [
+              { text: '💰 Custom Amount', web_app: { url: baseUrl } }
+            ]
+          ]
+        };
+        await tgCall('sendMessage', {
+          chat_id: callbackChatId,
+          text: '📨 *Quick Invoice*\n\nSelect an amount to create an invoice:',
+          reply_markup: keyboard,
+          parse_mode: 'Markdown'
+        });
+      } else if (callbackData === 'quick_send') {
+        await tgCall('sendMessage', {
+          chat_id: callbackChatId,
+          text: '⚡ *Quick Send*\n\nTo send crypto, use:\n`/send @username <amount> <asset>`\n\nExample:\n`/send @john 10 USDC`',
+          parse_mode: 'Markdown'
+        });
+      } else if (callbackData === 'create_party') {
+        await tgCall('sendMessage', {
+          chat_id: callbackChatId,
+          text: '🎉 *Create Party*\n\nTo create a party room, use:\n`/startparty`\n\nOr provide your wallet address:\n`/startparty 0xYourAddress`',
+          parse_mode: 'Markdown'
+        });
+      } else if (callbackData === 'list_parties') {
+        await tgCall('sendMessage', {
+          chat_id: callbackChatId,
+          text: '🔍 *Finding Parties*\n\n• List all parties: `/listparty`\n• Search parties: `/findparty <keyword>`\n\nExample:\n`/findparty room123`',
+          parse_mode: 'Markdown'
+        });
+      } else if (callbackData === 'view_balance') {
+        await tgCall('sendMessage', {
+          chat_id: callbackChatId,
+          text: '💳 *View Balance*\n\nUse `/balance` to view your wallet balance, or open the app to see detailed balances.',
+          reply_markup: {
+            inline_keyboard: [[{ text: '💰 Open Dial Pay', web_app: { url: baseUrl } }]]
+          },
+          parse_mode: 'Markdown'
+        });
+      } else if (callbackData === 'help') {
+        const keyboard = {
+          inline_keyboard: [
+            [{ text: '💰 Open Dial Pay', web_app: { url: baseUrl } }]
+          ]
+        };
+        await tgCall('sendMessage', {
+          chat_id: callbackChatId,
+          text: '❓ *Dial Pay Help*\n\n*💰 Payments:*\n• `/invoice <amount> <asset>` - Create invoice\n• `/send @user <amount> <asset>` - Send crypto\n• `/check <amount> <asset>` - Create voucher\n• `/balance` - View balance\n\n*🎉 Party Lines:*\n• `/startparty` - Create party\n• `/listparty` - List parties\n• `/findparty <keyword>` - Search\n\n*Assets:* USDT, USDC, ETH, BTC, TON, BNB, SOL',
+          reply_markup: keyboard,
+          parse_mode: 'Markdown'
+        });
+      } else if (callbackData && callbackData.startsWith('invoice_')) {
+        // Handle quick invoice creation (e.g., invoice_10_USDC)
+        const parts = callbackData.split('_');
+        const amount = parts[1];
+        const asset = parts[2] || 'USDC';
+
+        await tgCall('sendMessage', {
+          chat_id: callbackChatId,
+          text: `Creating ${amount} ${asset} invoice...\n\nUse: \`/invoice ${amount} ${asset}\` to create it now!`,
+          parse_mode: 'Markdown'
+        });
+      }
+
+      return NextResponse.json({ ok: true });
+    }
+
     const msg = body?.message;
     const text: string = msg?.text || '';
     const chatId = msg?.chat?.id;
@@ -190,7 +280,45 @@ export async function POST(req: NextRequest) {
     }
 
     if (/^\/start\b/.test(text)) {
-      await reply('💎 Dial Crypto Pay Bot\n\n💰 Payments:\n/invoice <amount> <asset> - Create invoice\n/send <user> <amount> <asset> - Send crypto\n/check <amount> <asset> - Create voucher\n/balance - View balance\n\n🎉 Party Lines:\n/startparty - Create party\n/listparty - List parties\n/findparty <keyword> - Search\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+      const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+
+      const message = `💎 *Dial Crypto Pay Bot*\n\nWelcome to Dial Pay - the easiest way to send and receive crypto on Telegram.\n\n*Commands:*\n• \`/invoice <amount> <asset>\` - Create invoice\n• \`/send @user <amount> <asset>\` - Send crypto\n• \`/balance\` - View wallet\n• \`/startparty\` - Create party room\n• \`/listparty\` - Browse parties\n\n*Supported:* USDT, USDC, ETH, BTC, TON, BNB, SOL`;
+
+      // In private chats, use web_app for native mini app experience
+      // In groups, fall back to regular URL buttons
+      const isPrivate = chatType === 'private';
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            isPrivate
+              ? { text: '💰 Open Dial Pay', web_app: { url: baseUrl } }
+              : { text: '💰 Open Dial Pay', url: baseUrl }
+          ],
+          [
+            { text: '📨 Create Invoice', url: `${baseUrl}?action=invoice` },
+            { text: '⚡ Send Payment', url: `${baseUrl}?action=send` }
+          ],
+          [
+            { text: '🎉 Party Rooms', url: 'https://staging.dial.wtf' }
+          ]
+        ]
+      };
+
+      // Send photo with caption and inline keyboard
+      const logoUrl = `${baseUrl}/phone.logo.no.bg.png`;
+      const result = await tgCall('sendPhoto', {
+        chat_id: chatId,
+        photo: logoUrl,
+        caption: message,
+        reply_markup: keyboard,
+        parse_mode: 'Markdown'
+      });
+
+      if (DEBUG && !result.ok) {
+        await reply(`Debug: sendPhoto failed - ${JSON.stringify(result)}`);
+      }
+
       return NextResponse.json({ ok: true });
     }
 

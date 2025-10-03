@@ -250,26 +250,26 @@ export default function Home() {
           border: t.border,
         }}
       >
-        <div className="flex-1 overflow-y-auto overscroll-contain space-y-3">
+        <div className="flex-1 overflow-y-auto overscroll-contain space-y-2.5">
         {/* Header */}
         <header className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2.5">
             <div
-              className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
+              className="w-9 h-9 rounded-full flex items-center justify-center text-sm font-bold"
               style={{ background: "linear-gradient(135deg, #2b1b4b, #1a0f2e)", color: t.text, border: t.border }}
             >
               {(user?.email?.address?.[0] || payee?.[2] || "D").toUpperCase()}
             </div>
             <div>
-              <div className="font-bold text-xs">Dial Pay</div>
+              <div className="font-bold text-sm">Dial Pay</div>
               {payee && (
                 <div className="text-[10px] font-mono" style={{ color: t.sub }}>
-                  {payee.slice(0, 4)}...{payee.slice(-3)}
+                  {payee.slice(0, 6)}...{payee.slice(-4)}
                 </div>
               )}
             </div>
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
             {authenticated ? (
               <>
                 <button
@@ -305,8 +305,8 @@ export default function Home() {
             <Image
               src="/phone.logo.no.bg.png"
               alt="Dial"
-              width={80}
-              height={80}
+              width={70}
+              height={70}
               priority
               className="mx-auto drop-shadow-[0_10px_40px_rgba(124,58,237,.35)]"
             />
@@ -314,36 +314,33 @@ export default function Home() {
 
           {/* Amount Input */}
           <div className="text-center">
-            <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
-              Amount
-            </label>
             <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl" style={{ background: 'rgba(255,255,255,0.95)', border: '1px solid rgba(124,58,237,0.3)' }}>
               <input
                 type="number"
                 value={amount}
                 onChange={(e) => setAmount(e.target.value)}
-                className="text-3xl sm:text-4xl leading-none font-black tracking-tight bg-transparent outline-none text-center w-28 sm:w-36"
+                className="text-3xl leading-none font-black tracking-tight bg-transparent outline-none text-center w-28"
                 style={{ color: '#1a0f2e' }}
-                placeholder="Enter amount"
+                placeholder="0.00"
                 step="0.01"
                 min="0"
               />
-              <div className="text-xl sm:text-2xl font-bold" style={{ color: t.accent1 }}>
+              <div className="text-xl font-bold" style={{ color: t.accent1 }}>
                 {selectedAsset}
               </div>
             </div>
           </div>
 
           {/* Quick Amount Buttons */}
-          <div className="grid grid-cols-4 gap-1.5">
+          <div className="grid grid-cols-4 gap-2">
             {[1, 5, 10, 50].map((val) => (
               <button
                 key={val}
                 onClick={() => setAmount(String(val))}
                 className="py-1.5 rounded-lg text-xs font-bold text-white transition-all active:scale-95"
-                style={{ 
-                  background: amount === String(val) ? t.accent1 : 'rgba(124,58,237,0.25)', 
-                  border: amount === String(val) ? t.border : '1px solid rgba(124,58,237,0.3)' 
+                style={{
+                  background: amount === String(val) ? t.accent1 : 'rgba(124,58,237,0.25)',
+                  border: amount === String(val) ? t.border : '1px solid rgba(124,58,237,0.3)'
                 }}
               >
                 {val}
@@ -351,66 +348,67 @@ export default function Home() {
             ))}
           </div>
 
-          {/* Asset Selector */}
-          <div>
-            <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
-              Asset
-            </label>
-            <div className="relative">
-              <select
-                value={selectedAsset}
-                onChange={(e) => setSelectedAsset(e.target.value as Asset)}
-                className="w-full p-2.5 rounded-lg text-sm font-bold appearance-none cursor-pointer transition-all"
-                style={{
-                  background: 'rgba(124,58,237,0.15)',
-                  border: '1px solid rgba(124,58,237,0.35)',
-                  color: t.text,
-                  paddingRight: '2.5rem',
-                }}
-              >
-                {(['USDC', 'USDT', 'ETH', 'BTC', 'TON', 'BNB', 'SOL'] as Asset[]).map((asset) => {
-                  const assetEmojis: Record<Asset, string> = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎' };
-                  return (
-                    <option key={asset} value={asset}>
-                      {assetEmojis[asset]} {asset}
-                    </option>
-                  );
-                })}
-              </select>
-              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: t.sub }}>
-                ▼
+          {/* Asset & Network in single row */}
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
+                Asset
+              </label>
+              <div className="relative">
+                <select
+                  value={selectedAsset}
+                  onChange={(e) => setSelectedAsset(e.target.value as Asset)}
+                  className="w-full p-2 rounded-lg text-sm font-bold appearance-none cursor-pointer transition-all"
+                  style={{
+                    background: 'rgba(124,58,237,0.15)',
+                    border: '1px solid rgba(124,58,237,0.35)',
+                    color: t.text,
+                    paddingRight: '2rem',
+                  }}
+                >
+                  {(['USDC', 'USDT', 'ETH', 'BTC', 'TON', 'BNB', 'SOL'] as Asset[]).map((asset) => {
+                    const assetEmojis: Record<Asset, string> = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎' };
+                    return (
+                      <option key={asset} value={asset}>
+                        {assetEmojis[asset]} {asset}
+                      </option>
+                    );
+                  })}
+                </select>
+                <div className="absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none text-xs" style={{ color: t.sub }}>
+                  ▼
+                </div>
               </div>
             </div>
-          </div>
 
-          {/* Network Selector */}
-          <div>
-            <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
-              Network
-            </label>
-            <div className="relative">
-              <select
-                value={selectedNetwork}
-                onChange={(e) => setSelectedNetwork(e.target.value as Network)}
-                className="w-full p-2.5 rounded-lg text-sm font-bold appearance-none cursor-pointer transition-all"
-                style={{
-                  background: 'rgba(124,58,237,0.15)',
-                  border: '1px solid rgba(124,58,237,0.35)',
-                  color: t.text,
-                  paddingRight: '2.5rem',
-                }}
-              >
-                {(['BASE', 'ETH', 'SOLANA', 'POLYGON', 'BNB', 'ARBITRUM', 'OPTIMISM', 'BITCOIN', 'LIGHTNING'] as Network[]).map((network) => {
-                  const info = NETWORK_INFO[network];
-                  return (
-                    <option key={network} value={network}>
-                      {info.emoji} {info.name}
-                    </option>
-                  );
-                })}
-              </select>
-              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: t.sub }}>
-                ▼
+            <div>
+              <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
+                Network
+              </label>
+              <div className="relative">
+                <select
+                  value={selectedNetwork}
+                  onChange={(e) => setSelectedNetwork(e.target.value as Network)}
+                  className="w-full p-2 rounded-lg text-sm font-bold appearance-none cursor-pointer transition-all"
+                  style={{
+                    background: 'rgba(124,58,237,0.15)',
+                    border: '1px solid rgba(124,58,237,0.35)',
+                    color: t.text,
+                    paddingRight: '2rem',
+                  }}
+                >
+                  {(['BASE', 'ETH', 'SOLANA', 'POLYGON', 'BNB', 'ARBITRUM', 'OPTIMISM'] as Network[]).map((network) => {
+                    const info = NETWORK_INFO[network];
+                    return (
+                      <option key={network} value={network}>
+                        {info.emoji} {info.name}
+                      </option>
+                    );
+                  })}
+                </select>
+                <div className="absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none text-xs" style={{ color: t.sub }}>
+                  ▼
+                </div>
               </div>
             </div>
           </div>
@@ -419,27 +417,22 @@ export default function Home() {
         {/* Recipient Address Input */}
         <div>
           <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
-            Recipient Address (Optional)
+            Recipient (Optional)
           </label>
           <input
             type="text"
-            placeholder="0x... or leave empty to use your wallet"
+            placeholder="0x... or use your wallet"
             value={recipient}
             onChange={(e) => setRecipient(e.target.value)}
             className="w-full p-2 rounded-lg bg-black/20 outline-none transition-all focus:bg-black/30 text-xs font-mono"
-            style={{ 
-              border: `1px solid rgba(124,58,237,0.3)`, 
+            style={{
+              border: `1px solid rgba(124,58,237,0.3)`,
               color: t.text,
               ...(recipient && !/^0x[0-9a-fA-F]{40}$/.test(recipient) && ['ETH', 'BASE', 'POLYGON', 'BNB', 'ARBITRUM', 'OPTIMISM'].includes(selectedNetwork) ? {
                 borderColor: 'rgba(239,68,68,0.6)',
               } : {})
             }}
           />
-          {recipient && !/^0x[0-9a-fA-F]{40}$/.test(recipient) && ['ETH', 'BASE', 'POLYGON', 'BNB', 'ARBITRUM', 'OPTIMISM'].includes(selectedNetwork) && (
-            <div className="text-[9px] mt-1" style={{ color: '#fca5a5' }}>
-              Invalid address format
-            </div>
-          )}
         </div>
 
         {/* Note Input */}
@@ -471,7 +464,7 @@ export default function Home() {
             disabled={loading || !amount || parseFloat(amount) <= 0}
             onClick={() => create("request")}
             className="py-2.5 rounded-lg text-sm font-bold text-white transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
-            style={{ 
+            style={{
               background: `linear-gradient(135deg, ${t.accent1} 0%, ${t.accent1}dd 100%)`,
               boxShadow: loading ? 'none' : '0 4px 20px rgba(124,58,237,0.4)',
             }}
@@ -482,7 +475,7 @@ export default function Home() {
             disabled={loading || !amount || parseFloat(amount) <= 0}
             onClick={() => create("send")}
             className="py-2.5 rounded-lg text-sm font-bold text-white transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
-            style={{ 
+            style={{
               background: `linear-gradient(135deg, ${t.accent2} 0%, ${t.accent2}dd 100%)`,
               boxShadow: loading ? 'none' : '0 4px 20px rgba(192,38,211,0.4)',
             }}
