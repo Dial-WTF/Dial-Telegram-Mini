@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { deployedCreate2Salts, predictContextByAddress } from '#/lib/mem';
+import { deployedCreate2Salts, predictContextByAddress, requestContextById } from '#/lib/mem';
+import { tg } from '#/lib/telegram';
 import { ethers } from 'ethers';
 
 export const runtime = 'nodejs';
@@ -51,6 +52,17 @@ export async function POST(req: NextRequest) {
     const tx = await createx.deployCreate2(ctx.salt, ctx.initCode);
     const receipt = await tx.wait();
     deployedCreate2Salts.add(saltKey);
+
+    // Try to update the original message status to Pending (🟡)
+    try {
+      const reqIdGuess = (body?.requestId || body?.event?.requestId || '').toString();
+      const maybeCtx = requestContextById.get(reqIdGuess);
+      if (maybeCtx?.chatId && maybeCtx?.messageId) {
+        const rm = maybeCtx.replyMarkup;
+        const kb = rm && rm.inline_keyboard ? { inline_keyboard: [...rm.inline_keyboard.slice(0, 2), [{ text: 'Status: 🟡 Pending', callback_data: 'status_pending' }]] } : rm;
+        await tg.editCaption(maybeCtx.chatId, maybeCtx.messageId, 'Request: Pending', kb);
+      }
+    } catch {}
 
     return NextResponse.json({ ok: true, txHash: tx.hash, receipt });
   } catch (e: any) {

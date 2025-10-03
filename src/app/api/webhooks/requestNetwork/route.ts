@@ -21,7 +21,7 @@ export async function POST(req: NextRequest) {
     const ctx = requestContextById.get(requestId || '');
     const chatId = ctx?.chatId;
     const messageId = ctx?.messageId;
-    const caption = ctx?.paidCaption || '✅ PAID';
+    const caption = '✅ PAID';
     const replyMarkup = ctx?.replyMarkup;
 
     // Consider these as "paid" signals; adjust to exact value from your dashboard (e.g., "Payment Confirmed")
@@ -29,7 +29,15 @@ export async function POST(req: NextRequest) {
 
     if (looksPaid && chatId && messageId) {
       try {
-        await tg.editCaption(chatId, Number(messageId), caption, replyMarkup);
+        // Replace QR content with brand image and keep only Request Scan + Paid status
+        const kb = replyMarkup && replyMarkup.inline_keyboard
+          ? { inline_keyboard: [
+              [{ text: 'Open invoice', url: (replyMarkup.inline_keyboard[0]?.[0]?.url) || '' }].filter(Boolean),
+              [{ text: 'View on Request Scan', url: (replyMarkup.inline_keyboard[1]?.[0]?.url) || '' }],
+              [{ text: 'Status: ✅ Paid', callback_data: 'status_paid' }],
+            ].filter((row: any) => row.length > 0) }
+          : undefined;
+        await tg.editCaption(chatId, Number(messageId), caption, kb);
       } catch (e) {
         // Fall through; still return 200 to avoid retries if not desired
         console.error('Failed to edit caption for webhook:', (e as any)?.message || e);
