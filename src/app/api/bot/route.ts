@@ -1,16 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { appConfig } from '@/lib/config';
+import { appConfig } from '#/lib/config';
 import { parseEther, Interface } from 'ethers';
-import { parseRequest } from '@/lib/parse';
-import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '@/lib/addr';
-import { tg } from '@/lib/telegram';
-import { fetchPayCalldata } from '@/lib/requestApi';
-import { bpsToPercentString } from '@/lib/fees';
-import { buildEthereumUri, decodeProxyDataAndValidateValue } from '@/lib/ethUri';
-import { estimateGasAndPrice } from '@/lib/gas';
-import { buildQrForRequest } from '@/lib/qrUi';
-import { isValidEthereumAddress } from '@/lib/utils';
-import { requestContextById } from '@/lib/mem';
+import { parseRequest } from '#/lib/parse';
+import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '#/lib/addr';
+import { tg } from '#/lib/telegram';
+import { fetchPayCalldata, extractForwarderInputs } from '#/lib/requestApi';
+import { bpsToPercentString } from '#/lib/fees';
+import { buildEthereumUri, decodeProxyDataAndValidateValue } from '#/lib/ethUri';
+import { buildPredictTenderlyInput, predictDestinationTenderly, createIncomingPaymentAlert } from '#/lib/tenderlyApi';
+  import { createAddressActivityWebhook, updateWebhookAddresses } from '#/lib/alchemyWebhooks';
+import ForwarderArtifact from '#/lib/contracts/DepositForwarderMinimal/DepositForwarderMinimal.json';
+import { keccak256, toHex } from 'viem';
+import { estimateGasAndPrice } from '#/lib/gas';
+import { buildQrForRequest } from '#/lib/qrUi';
+import { isValidEthereumAddress } from '#/lib/utils';
+import { requestContextById, predictContextByAddress } from '#/lib/mem';
+import { writeFile as writeS3File } from '#/services/s3/actions/writeFile';
+import { PATH_INVOICES } from '#/services/s3/filepaths';
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
 const pendingAddressByUser = new Map<number, { amount: number; note: string }>();
@@ -175,7 +181,7 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true, error: t });
         }
         const json = await rest.json();
-        const id = json.paymentReference || json.requestID || json.requestId;
+        const id = json.requestId || json.requestID || json.id;
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const openUrl = `${baseUrl}/pay/${id}`;
         const keyboard = { inline_keyboard: [[{ text: 'Open', web_app: { url: openUrl } }]] } as any;
@@ -682,26 +688,37 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true });
         }
 
-        const rest = await fetch(`${apiBase}/api/invoice`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json', 'Accept': 'application/json',
-            'x-internal': process.env.INTERNAL_API_KEY || '',
-          },
-          body: JSON.stringify({
-            payee,
-            amount: Number(amt),
-            note,
-            kind: 'request',
-            initData: '',
-          }),
-        });
+        let rest: Response;
+        try {
+          if (DEBUG) {
+            try { console.log('[BOT]/request -> POST', `${apiBase}/api/invoice`, { payee, amount: Number(amt), note }); } catch {}
+          }
+          rest = await fetch(`${apiBase}/api/invoice`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json', 'Accept': 'application/json',
+              'x-internal': process.env.INTERNAL_API_KEY || '',
+            },
+            body: JSON.stringify({
+              payee,
+              amount: Number(amt),
+              note,
+              kind: 'request',
+              initData: '',
+            }),
+          });
+        } catch (err: any) {
+          if (DEBUG) { try { console.warn('[BOT]/request fetch /api/invoice failed:', err?.message || err); } catch {} }
+          throw err;
+        }
         if (!rest.ok) {
-          const t = await rest.text();
+          const t = await rest.text().catch(() => '');
+          if (DEBUG) { try { console.warn('[BOT]/request invoice non-OK:', rest.status, rest.statusText, t.slice(0, 300)); } catch {} }
           await reply(`Failed to create invoice: ${rest.status} ${rest.statusText}`);
           return NextResponse.json({ ok: true, error: t });
         }
-        const json = await rest.json();
+        const json = await rest.json().catch(() => ({} as any));
+        if (DEBUG) { try { console.log('[BOT]/request invoice OK response keys:', Object.keys(json || {})); } catch {} }
         const id = json.requestId || json.requestID || json.id;
         if (!id) {
           await reply('Invoice created but id missing');
@@ -710,37 +727,120 @@ export async function POST(req: NextRequest) {
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const invUrl = `${baseUrl}/pay/${id}`;
 
-        // Build QR using utils and pay endpoint; fallback to invoice link on any mismatch
+        // Build QR using forwarder prediction (Create2) for improved wallet compatibility
         let ethUri: string | undefined;
         try {
           const feeAddress = process.env.FEE_ADDRESS || appConfig.feeAddr || undefined;
           const feePercentage = feeAddress ? bpsToPercentString(process.env.FEE_BPS || '50') : undefined;
+          if (DEBUG) { try { console.log('[BOT]/request fetching pay calldata for id=', id); } catch {} }
           const payJson = await fetchPayCalldata(id, { feeAddress, feePercentage, apiKey: appConfig.request.apiKey || process.env.REQUEST_API_KEY });
-          const txs: any[] = Array.isArray((payJson as any)?.transactions) ? (payJson as any).transactions : [];
-          const idx: number = Number.isInteger((payJson as any)?.metadata?.paymentTransactionIndex)
-            ? (payJson as any).metadata.paymentTransactionIndex
-            : 0;
-          const sel = txs[idx] || txs[0];
-          if (sel && typeof sel.to === 'string') {
-            const toAddr: string = sel.to;
-            const data: string | undefined = typeof sel.data === 'string' ? sel.data : undefined;
-            const hexVal: string | undefined = typeof sel.value?.hex === 'string' ? sel.value.hex : undefined;
-            const decVal = (() => { try { return hexVal ? BigInt(hexVal).toString(10) : '0'; } catch { return '0'; } })();
-            let gasDec: string | undefined;
-            let gasPriceDec: string | undefined;
-            if (process.env.QR_INCLUDE_GAS_HINTS === '1') {
-              const est = await estimateGasAndPrice({ rpcUrl: process.env.RPC_URL, to: toAddr, data, valueWeiDec: decVal });
-              gasDec = est.gas; gasPriceDec = est.gasPrice;
+          if (DEBUG) { try { console.log('[BOT]/request pay transactions:', Array.isArray((payJson as any)?.transactions) ? (payJson as any).transactions.length : 0); } catch {} }
+          const fwd = extractForwarderInputs(payJson);
+          if (DEBUG) { try { console.log('[BOT]/request forwarder inputs:', { proxy: fwd.requestProxy, to: fwd.beneficiary, feeAddress: fwd.feeAddress, feeAmountWei: String(fwd.feeAmountWei), hasAmount: typeof fwd.amountWei === 'bigint' }); } catch {} }
+
+          // Compute network id and CreateX config
+          const chainKey = String(appConfig.request.chain || '').toLowerCase();
+          const NETWORK_ID_BY_CHAIN: Record<string, string> = { base: '8453', ethereum: '1', mainnet: '1', sepolia: '11155111' };
+          const networkId = process.env.TENDERLY_NETWORK_ID || NETWORK_ID_BY_CHAIN[chainKey] || '1';
+          const createx = (process.env.CREATEX_ADDRESS || process.env.CREATE_X || '').trim() as `0x${string}`;
+          const from = (process.env.TENDERLY_FROM || process.env.CREATEX_FROM || '').trim() as `0x${string}`;
+          if (!/^0x[0-9a-fA-F]{40}$/.test(createx)) throw new Error('Missing CREATEX_ADDRESS');
+          if (!/^0x[0-9a-fA-F]{40}$/.test(from)) throw new Error('Missing TENDERLY_FROM');
+
+          // Salt ties deposit address to request id and chain
+          const salt = keccak256(toHex(`DIAL|${id}|${networkId}`)) as `0x${string}`;
+          const predictInput = buildPredictTenderlyInput({
+            networkId,
+            createx,
+            from,
+            requestProxy: fwd.requestProxy,
+            beneficiary: fwd.beneficiary,
+            paymentReferenceHex: fwd.paymentReferenceHex,
+            feeAmountWei: fwd.feeAmountWei,
+            feeAddress: fwd.feeAddress,
+            salt,
+            artifact: { bytecode: (ForwarderArtifact as any)?.bytecode as `0x${string}` },
+          });
+          if (DEBUG) { try { console.log('[BOT]/request predict input:', { networkId, createx, from, salt: predictInput.salt.slice(0,10)+'…', initCodeLen: predictInput.initCode.length }); } catch {} }
+          const { predicted } = await predictDestinationTenderly(predictInput);
+          if (DEBUG) { try { console.log('[BOT]/request predicted address:', predicted); } catch {} }
+          if (predicted && fwd.amountWei && fwd.amountWei > 0n) {
+            const decVal = fwd.amountWei.toString(10);
+            // Save predict context for webhook
+            try {
+              predictContextByAddress.set(String(predicted).toLowerCase(), {
+                networkId,
+                createx,
+                salt: predictInput.salt,
+                initCode: predictInput.initCode,
+                from,
+              });
+            } catch {}
+            // Persist invoice metadata to S3 for later lookup by predicted address
+            try {
+              const tgUserName: string = (msg?.from?.username || '').toString();
+              const lowerPred = String(predicted).toLowerCase();
+              const fileName = `invoice-${lowerPred}-${tgUserName || 'anon'}-${id}.json`;
+              const s3Key = `${PATH_INVOICES}${fileName}`;
+              const scanUrl = `https://scan.request.network/request/${id}`;
+              const chainIdNum = Number(networkId) || 1;
+              const payUri = buildEthereumUri({ to: String(predicted), valueWeiDec: decVal, chainId: chainIdNum });
+              const record = {
+                requestId: id,
+                networkId,
+                predictedAddress: String(predicted),
+                salt: predictInput.salt,
+                initCode: predictInput.initCode,
+                requestProxy: fwd.requestProxy,
+                beneficiary: fwd.beneficiary,
+                paymentReferenceHex: fwd.paymentReferenceHex,
+                feeAmountWei: fwd.feeAmountWei.toString(),
+                feeAddress: fwd.feeAddress,
+                amountWei: decVal,
+                ethereumUri: payUri,
+                requestScanUrl: scanUrl,
+                telegram: {
+                  chatId,
+                  chatType,
+                  userId: tgUserId,
+                  username: tgUserName || undefined,
+                  commandText: text,
+                },
+                createdAt: new Date().toISOString(),
+              } as const;
+              const body = Buffer.from(JSON.stringify(record, null, 2));
+              await writeS3File(s3Key, { Body: body, ContentType: 'application/json' });
+              if (DEBUG) { try { console.log('[BOT]/request saved invoice json to S3:', s3Key); } catch {} }
+            } catch (e) {
+              if (DEBUG) { try { console.warn('[BOT]/request failed to save invoice S3:', (e as any)?.message || e); } catch {} }
             }
-            ethUri = buildEthereumUri({ to: toAddr, valueWeiDec: decVal, data, chainId: 1, gas: gasDec, gasPrice: gasPriceDec });
-            const check = decodeProxyDataAndValidateValue(data, decVal, amt);
-            if (!check.ok) {
-              if (DEBUG) { try { console.warn('[BOT] Value/fee mismatch; fallback', check); } catch {} }
-              ethUri = undefined;
+            // Register address activity on Alchemy webhook (create once, then update addresses)
+            try {
+              const alchemyWebhookId = process.env.ALCHEMY_WEBHOOK_ID;
+              if (alchemyWebhookId) {
+                await updateWebhookAddresses({ webhookId: alchemyWebhookId, add: [predicted as `0x${string}`], remove: [] });
+                if (DEBUG) {
+                  try { console.log('[BOT]/request alchemy: added address to webhook', { webhookId: alchemyWebhookId, address: predicted }); } catch {}
+                }
+              } else {
+                const created = await createAddressActivityWebhook({ addresses: [predicted as `0x${string}`] });
+                if (DEBUG) {
+                  try { console.log('[BOT]/request alchemy: created webhook', created); } catch {}
+                }
+              }
+            } catch (e) {
+              if (DEBUG) { try { console.warn('[BOT] alchemy webhook setup failed', { error: (e as any)?.message || e }); } catch {} }
             }
-            if (DEBUG && ethUri) { try { console.log('[BOT] built ethUri from pay endpoint:', ethUri); } catch {} }
+            // Action registration temporarily disabled; focusing on alert only
+
+            // Build direct ETH URI to pay predicted deposit address
+            const chainIdNum = Number(networkId) || 1;
+            ethUri = buildEthereumUri({ to: predicted, valueWeiDec: decVal, chainId: chainIdNum });
+            if (DEBUG && ethUri) { try { console.log('[BOT] built ethUri (predict):', ethUri); } catch {} }
           }
-        } catch {}
+        } catch (e) {
+          if (DEBUG) { try { console.warn('[BOT] forwarder predict failed; fallback to invoice link', (e as any)?.message || e); } catch {} }
+        }
         const { qrUrl, caption, keyboard, payUrl: builtPayUrl } = buildQrForRequest(baseUrl, id, ethUri, amt, note || '');
         const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
         const messageId = sent?.result?.message_id as number | undefined;

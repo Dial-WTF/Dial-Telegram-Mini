@@ -1,6 +1,6 @@
 // Utility functions for crypto payment operations
 
-import { SupportedAsset, SupportedFiat, CHAIN_CONFIGS, TOKEN_ADDRESSES } from '@/types/crypto';
+import { SupportedAsset, SupportedFiat, CHAIN_CONFIGS, TOKEN_ADDRESSES } from '#/types/crypto';
 
 // Supported chain IDs
 export const SUPPORTED_CHAINS = {

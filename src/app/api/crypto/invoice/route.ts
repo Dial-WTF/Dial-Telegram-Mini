@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { CreateInvoiceRequest, CryptoInvoice } from '@/types/crypto';
+import { CreateInvoiceRequest, CryptoInvoice } from '#/types/crypto';
 import {
   generateInvoiceId,
   isValidAsset,
   isValidFiat,
   calculateExpiry,
   getAssetEmoji,
-} from '@/lib/crypto-utils';
+} from '#/lib/crypto-utils';
 
 // In-memory storage (replace with database in production)
 const invoices = new Map<string, CryptoInvoice>();

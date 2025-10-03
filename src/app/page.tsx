@@ -3,10 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import { usePrivy, useWallets, useFundWallet } from "@privy-io/react-auth"; // embedded wallet & funding
-import BottomNav from "@/components/BottomNav";
-import { useTelegramWebApp } from "@/lib/hooks/useTelegram";
-import { usePayeeAddress } from "@/lib/hooks/usePayeeAddress";
-import { OnrampModal } from "@/components/OnrampModal";
+import BottomNav from "#/components/BottomNav";
+import { useTelegramWebApp } from "#/lib/hooks/useTelegram";
+import { usePayeeAddress } from "#/lib/hooks/usePayeeAddress";
+import { OnrampModal } from "#/components/OnrampModal";
 
 // Dial retro neon theme (purple)
 const t = {

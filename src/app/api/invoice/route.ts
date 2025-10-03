@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { validate } from "@telegram-apps/init-data-node";
 import { RequestNetwork, Types } from "@requestnetwork/request-client.js";
-import { appConfig } from "@/lib/config";
-import { resolveEnsToHex, isValidHexAddress, normalizeHexAddress } from "@/lib/addr";
+import { appConfig } from "#/lib/config";
+import { resolveEnsToHex, isValidHexAddress, normalizeHexAddress } from "#/lib/addr";
 export const runtime = 'nodejs';
 
 export async function POST(req: NextRequest) {
@@ -71,33 +71,37 @@ export async function POST(req: NextRequest) {
         'x-api-key': appConfig.request.apiKey as string,
         'Accept': 'application/json',
       };
-      if (DEBUG_REQ) {
-        try {
-          const masked = (k?: string) => (k ? `${k.slice(0, 5)}…${k.slice(-4)}` : '');
-          console.log('[REQ][REST] endpoint=', endpoint);
-          console.log('[REQ][REST] headers=', { ...headers, 'x-api-key': masked(headers['x-api-key']) });
-          console.log('[REQ][REST] payload=', payload);
-        } catch {}
+      try {
+        if (DEBUG_REQ) {
+          try {
+            const masked = (k?: string) => (k ? `${k.slice(0, 5)}…${k.slice(-4)}` : '');
+            console.log('[REQ][REST] endpoint=', endpoint);
+            console.log('[REQ][REST] headers=', { ...headers, 'x-api-key': masked(headers['x-api-key']) });
+            console.log('[REQ][REST] payload=', payload);
+          } catch {}
+        }
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const txt = await resp.text().catch(() => '');
+          if (DEBUG_REQ) { try { console.log('[REQ][REST] non-OK', resp.status, resp.statusText, txt.slice(0, 300)); } catch {} }
+        } else {
+          const json = await resp.json();
+          if (DEBUG_REQ) { try { console.log('[REQ][REST] response', json); } catch {} }
+          requestId = json.requestID || json.requestId;
+          paymentReference = json.paymentReference;
+          if (!requestId && !paymentReference) throw new Error('Missing requestId from Request REST response');
+          const base = appConfig.publicBaseUrl || '';
+          const payUrl = base ? `${base}/pay/${requestId}` : `/pay/${requestId}`;
+          return NextResponse.json({ requestId, paymentReference, payUrl });
+        }
+      } catch (e: any) {
+        if (DEBUG_REQ) { try { console.log('[REQ][REST] fetch failed; falling back to SDK:', e?.message || e); } catch {} }
+        // fall through to SDK
       }
-      const resp = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-      });
-      if (!resp.ok) {
-        const txt = await resp.text();
-        if (DEBUG_REQ) { try { console.log('[REQ][REST] error', resp.status, resp.statusText, txt); } catch {} }
-        throw new Error(`Request REST error: ${resp.status} ${resp.statusText} ${txt}`);
-      }
-      const json = await resp.json();
-      if (DEBUG_REQ) { try { console.log('[REQ][REST] response', json); } catch {} }
-      requestId = json.requestID || json.requestId;
-      paymentReference = json.paymentReference;
-      const idForUrl = paymentReference || requestId;
-      if (!idForUrl) throw new Error('Missing request id from Request REST response');
-      const base = appConfig.publicBaseUrl || '';
-      const payUrl = base ? `${base}/pay/${idForUrl}` : `/pay/${idForUrl}`;
-      return NextResponse.json({ requestId: idForUrl, payUrl });
     }
 
     const client = new RequestNetwork({

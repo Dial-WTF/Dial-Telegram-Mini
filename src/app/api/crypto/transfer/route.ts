@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { TransferRequest, CryptoTransfer } from '@/types/crypto';
+import { TransferRequest, CryptoTransfer } from '#/types/crypto';
 import {
   generateTransferId,
   isValidAsset,
@@ -10,7 +10,7 @@ import {
   getTokenAddress,
   getChainForAsset,
   isNativeCurrency,
-} from '@/lib/crypto-utils';
+} from '#/lib/crypto-utils';
 
 // In-memory storage
 const transfers = new Map<string, CryptoTransfer>();

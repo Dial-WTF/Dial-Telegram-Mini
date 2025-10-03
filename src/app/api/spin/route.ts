@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { validate } from '@telegram-apps/init-data-node';
-import { appConfig } from '@/lib/config';
+import { appConfig } from '#/lib/config';
 
 export const runtime = 'nodejs';
 

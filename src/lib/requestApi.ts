@@ -1,4 +1,5 @@
-import { appConfig } from '@/lib/config';
+import { appConfig } from '#/lib/config';
+import { decodeFunctionData, hexToBigInt } from 'viem';
 
 export type RequestCreatePayload = {
   payee: string;
@@ -66,6 +67,51 @@ export async function fetchPayCalldata(requestId: string, opts?: { feeAddress?: 
   }
   const json = await res.json();
   return json as PayResponse;
+}
+
+
+// Decodes the first pay transaction into forwarder constructor inputs
+export function extractForwarderInputs(pay: PayResponse): {
+  requestProxy: `0x${string}`;
+  beneficiary: `0x${string}`;
+  paymentReferenceHex: `0x${string}`;
+  feeAmountWei: bigint;
+  feeAddress: `0x${string}`;
+  amountWei?: bigint;
+} {
+  if (!pay?.transactions?.length) throw new Error('No transactions in pay response');
+  const tx0 = pay.transactions[0];
+  const proxy = tx0.to as `0x${string}`;
+  const valueWei = tx0?.value && 'hex' in (tx0.value as any) && (tx0.value as any).hex ? hexToBigInt((tx0.value as any).hex as `0x${string}`) : undefined;
+
+  const proxyAbi = [
+    {
+      type: 'function',
+      name: 'transferWithReferenceAndFee',
+      stateMutability: 'payable',
+      inputs: [
+        { name: '_to', type: 'address' },
+        { name: '_paymentReference', type: 'bytes' },
+        { name: '_feeAmount', type: 'uint256' },
+        { name: '_feeAddress', type: 'address' },
+      ],
+      outputs: [],
+    },
+  ] as const;
+
+  const decoded = decodeFunctionData({ abi: proxyAbi, data: (tx0.data || '0x') as `0x${string}` });
+  const [beneficiary, paymentReferenceHex, feeAmountWei, feeAddress] = decoded.args as [
+    `0x${string}`, `0x${string}`, bigint, `0x${string}`
+  ];
+
+  return {
+    requestProxy: proxy,
+    beneficiary,
+    paymentReferenceHex,
+    feeAmountWei,
+    feeAddress,
+    amountWei: valueWei,
+  };
 }
 
 

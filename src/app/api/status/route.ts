@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { RequestNetwork } from "@requestnetwork/request-client.js";
-import { appConfig } from "@/lib/config";
+import { appConfig } from "#/lib/config";
 export const runtime = 'nodejs';
 
 export async function GET(req: NextRequest) {

@@ -1,4 +1,4 @@
-import { formatCaption } from '@/lib/format';
+import { formatCaption } from '#/lib/format';
 
 export function buildQrForRequest(baseUrl: string, id: string, ethUri: string | undefined, amt: number, note: string) {
   const base = (baseUrl || '').replace(/\/$/, '');

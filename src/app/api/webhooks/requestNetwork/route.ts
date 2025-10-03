@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { tg } from '@/lib/telegram';
-import { requestContextById } from '@/lib/mem';
+import { tg } from '#/lib/telegram';
+import { requestContextById } from '#/lib/mem';
 
 export const runtime = 'nodejs';
 
