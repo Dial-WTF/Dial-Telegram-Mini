@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import BottomNav from "@/components/BottomNav";
+import BottomNav from "#/components/BottomNav";
 
 type Prize = { kind: string; label: string; amount?: number };
 

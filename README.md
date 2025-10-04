@@ -1,4 +1,31 @@
-## Dial Pay — Telegram Mini App (TMA)
+## Dial Pay# Dial Telegram Mini - Crypto Pay Bot
+
+Multi-currency crypto payment bot for Telegram with Privy wallet integration.
+
+## Features
+
+### 💎 Crypto Payments
+- **Multi-currency support**: USDT, USDC, ETH, BTC, TON, BNB, SOL, TRX, LTC
+- **Invoice creation**: Create payment requests with any supported asset
+- **Direct transfers**: Send crypto to users via Telegram
+- **Crypto checks**: Create vouchers/gift cards that can be claimed
+- **Non-custodial**: Users connect their own Privy wallets
+
+### 🎉 Party Lines
+- Create and manage party rooms on dial.wtf
+- Search parties by name, room code, or address
+- List all active party rooms
+
+### 🤖 Bot Commands
+- `/invoice <amount> <asset> [description]` - Create crypto invoice
+- `/send <user> <amount> <asset> [comment]` - Send crypto
+- `/check <amount> <asset> [pin_to_user]` - Create voucher
+- `/balance` - View wallet balance
+- `/startparty [wallet]` - Create party room
+- `/listparty` - List parties
+- `/findparty <keyword>` - Search parties
+
+## Dial Telegram Mini App (TMA)
 
 Dial-themed Telegram Mini App to create Request Network invoices with a Cash-App style UI. Runs inside Telegram’s webview, validates Telegram `initData` server-side, optionally uses Privy embedded wallets as payee, creates a Request invoice, and exposes a `/pay/[id]` page with QR + live status polling.
 

@@ -1,9 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { appConfig } from '@/lib/config';
+import { appConfig } from '#/lib/config';
 import { parseEther, Interface } from 'ethers';
-import { parseRequest } from '@/lib/parse';
-import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '@/lib/addr';
-import { tg } from '@/lib/telegram';
+import { parseRequest } from '#/lib/parse';
+import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '#/lib/addr';
+import { tg } from '#/lib/telegram';
+import { fetchPayCalldata, extractForwarderInputs } from '#/lib/requestApi';
+import { bpsToPercentString } from '#/lib/fees';
+import { buildEthereumUri, decodeProxyDataAndValidateValue } from '#/lib/ethUri';
+import { buildPredictTenderlyInput, predictDestinationTenderly, createIncomingPaymentAlert } from '#/lib/tenderlyApi';
+  import { createAddressActivityWebhook, updateWebhookAddresses } from '#/lib/alchemyWebhooks';
+import ForwarderArtifact from '#/lib/contracts/DepositForwarderMinimal/DepositForwarderMinimal.json';
+import { keccak256, toHex } from 'viem';
+import { estimateGasAndPrice } from '#/lib/gas';
+import { buildQrForRequest } from '#/lib/qrUi';
+import { isValidEthereumAddress } from '#/lib/utils';
+import { requestContextById, predictContextByAddress, requestIdByPredictedAddress } from '#/lib/mem';
+import { writeFile as writeS3File } from '#/services/s3/actions/writeFile';
+import { s3 } from '#/services/s3/client';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { AWS_S3_BUCKET } from '#/config/constants';
+import { PATH_INVOICES } from '#/services/s3/filepaths';
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
 const pendingAddressByUser = new Map<number, { amount: number; note: string }>();
@@ -60,6 +76,139 @@ async function getPrivyClient() {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    // Handle callback queries for status refresh
+    const callback = body?.callback_query;
+    if (callback && callback.id && callback.message && typeof callback.data === 'string') {
+      const chatIdCb = callback.message.chat?.id;
+      const messageIdCb = callback.message.message_id;
+      const data = callback.data as string;
+      // Data may be very short; derive reqId from original message entities/URLs
+      if (data === 'sr' && chatIdCb && messageIdCb) {
+        // Derive requestId from message content
+        let reqId = '';
+        try {
+          const entities = (callback.message as any).caption_entities || callback.message.entities || [];
+          const text: string = callback.message.caption || callback.message.text || '';
+          for (const ent of entities) {
+            const t = ent.type;
+            if (t === 'text_link' && ent.url) {
+              const m = ent.url.match(/\/pay\/([^/?#]+)/);
+              if (m) { reqId = m[1]; break; }
+            }
+          }
+          if (!reqId) {
+            const m2 = text.match(/https?:\/\/[^\s]+\/pay\/([^\s]+)/);
+            if (m2) reqId = m2[1];
+          }
+          // Fallback: scan reply_markup button URLs
+          if (!reqId) {
+            try {
+              const rm: any = (callback.message as any)?.reply_markup;
+              const rows: any[] = Array.isArray(rm?.inline_keyboard) ? rm.inline_keyboard : [];
+              for (const row of rows) {
+                for (const btn of row) {
+                  const u: string | undefined = btn?.url;
+                  if (u && typeof u === 'string') {
+                    let m = u.match(/\/pay\/([^\/?#]+)/);
+                    if (m) { reqId = m[1]; break; }
+                    m = u.match(/scan\.request\.network\/request\/([^\/?#]+)/);
+                    if (m) { reqId = m[1]; break; }
+                  }
+                }
+                if (reqId) break;
+              }
+            } catch {}
+          }
+          if (!reqId) throw new Error('request id not found');
+        } catch (err: any) {
+          // Fallback: look up requestId by chatId/messageId from S3 index
+          try {
+            const key = `${PATH_INVOICES}by-message/${chatIdCb}/${messageIdCb}.json`;
+            const obj = await s3.send(new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key }));
+            const text = await (obj.Body as any).transformToString();
+            const rec = JSON.parse(text || '{}');
+            const rid = rec?.requestId || rec?.id;
+            if (rid && typeof rid === 'string') {
+              reqId = rid;
+            } else {
+              throw new Error('request id not found');
+            }
+          } catch (e) {
+            await tg.answerCallback(callback.id, 'Unable to refresh status');
+            return NextResponse.json({ ok: false });
+          }
+        }
+        try {
+          const base = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+          const url = `${base}/api/status?id=${encodeURIComponent(reqId)}`;
+          let s: any = null;
+          try {
+            const resp = await fetch(url);
+            const txt = await resp.text();
+            try { s = JSON.parse(txt); } catch { s = { status: resp.ok ? 'pending' : 'error', error: txt.slice(0, 200) }; }
+          } catch (netErr: any) {
+            throw new Error(`status fetch failed: ${netErr?.message || 'network'}`);
+          }
+          const status = String(s?.status || 'pending');
+          const emoji = status === 'paid' ? '✅' : status === 'pending' ? '🟡' : '❌';
+          const newStatusText = `Click for Status: ${emoji} ${status.charAt(0).toUpperCase()}${status.slice(1)}`;
+          // If markup already has identical Status button text, skip editing to avoid 400 not-modified
+          let prevStatusText = '';
+          try {
+            const rm: any = (callback.message as any)?.reply_markup;
+            const rows: any[] = Array.isArray(rm?.inline_keyboard) ? rm.inline_keyboard : [];
+            for (const row of rows) {
+              for (const btn of row) {
+                if (btn && typeof btn.text === 'string' && btn.text.startsWith('Status:')) {
+                  prevStatusText = btn.text;
+                  break;
+                }
+              }
+              if (prevStatusText) break;
+            }
+          } catch {}
+          const kb = { inline_keyboard: [
+            [{ text: 'Open invoice', url: `${base}/pay/${reqId}` }],
+            [{ text: 'View on Request Scan', url: `https://scan.request.network/request/${reqId}` }],
+            [{ text: newStatusText, callback_data: 'sr' }],
+          ] } as any;
+          if (status === 'paid') {
+            // Try to fetch last-known payment details to enrich caption
+            let pretty = '✅ PAID';
+            try {
+              const s2 = await fetch(`${base}/api/status?id=${encodeURIComponent(reqId)}`).then(r => r.json());
+              const amt = (s2?.balance?.paidAmount || s2?.amount || '').toString();
+              const currency = (s2?.currency || 'ETH').toString().toUpperCase();
+              const tsIso = (s2?.timestamp || new Date().toISOString()).toString();
+              const d = new Date(tsIso);
+              const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+              const dd = String(d.getUTCDate()).padStart(2, '0');
+              const yy = String(d.getUTCFullYear()).slice(-2);
+              const hh = String(d.getUTCHours()).padStart(2, '0');
+              const mi = String(d.getUTCMinutes()).padStart(2, '0');
+              const net = (s2?.network || 'mainnet').toString();
+              const netName = net.charAt(0).toUpperCase() + net.slice(1);
+              pretty = `✅ ${amt || ''} ${currency} paid on ${mm}/${dd}/${yy} @ ${hh}:${mi} UTC\nOn ${netName}\nPowered by Request Network`;
+            } catch {}
+            const mediaUrl = `${base}/Dial.letters.transparent.bg.crop.png`;
+            try {
+              await tg.editMedia(chatIdCb, messageIdCb, { type: 'photo', media: mediaUrl, caption: pretty }, kb);
+            } catch {
+              // If media unchanged or fails, still attempt markup edit when different
+              if (prevStatusText !== newStatusText) {
+                await tg.editReplyMarkup(chatIdCb, messageIdCb, kb);
+              }
+            }
+          } else if (prevStatusText !== newStatusText) {
+            await tg.editReplyMarkup(chatIdCb, messageIdCb, kb);
+          }
+          await tg.answerCallback(callback.id, newStatusText);
+        } catch (e: any) {
+          await tg.answerCallback(callback.id, e?.message || 'Error');
+        }
+        return NextResponse.json({ ok: true });
+      }
+    }
     // Inline mode support: when users type @YourBot in any chat
     const inline = body?.inline_query;
     if (inline && inline.id) {
@@ -145,47 +294,20 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true });
       }
       try {
-        const rawBase = (appConfig.request.restBase || 'https://api.request.network');
-        const baseTrim = rawBase.replace(/\/$/, '');
-        const endpoint = /\/v1$/.test(baseTrim)
-          ? `${baseTrim}/request`
-          : /\/v2$/.test(baseTrim)
-          ? `${baseTrim}/request`
-          : `${baseTrim}/v2/request`;
-        const apiKey = appConfig.request.apiKey || process.env.REQUEST_API_KEY;
-        if (!apiKey) {
-          await reply('Server missing REQUEST_API_KEY');
-          return NextResponse.json({ ok: false }, { status: 200 });
-        }
-        const rest = await fetch(endpoint, {
+        const apiBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const rest = await fetch(`${apiBase}/api/invoice`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'x-api-key': apiKey as string,
+            'x-internal': process.env.INTERNAL_API_KEY || '',
           },
           body: JSON.stringify({
             payee: addr,
-            amount: String(ctx.amount),
-            invoiceCurrency: 'ETH-mainnet',
-            paymentCurrency: 'ETH-mainnet',
-            reference: ctx.note || '',
-            paymentNetwork: {
-              id: 'ETH_FEE_PROXY_CONTRACT',
-              parameters: {
-                paymentNetworkName: 'mainnet',
-                paymentAddress: addr,
-                feeAddress: process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!,
-                feeAmount: (() => {
-                  try {
-                    const bps = Number(process.env.FEE_BPS || '50');
-                    const wei = parseEther(String(ctx.amount));
-                    const fee = (wei * BigInt(bps)) / 10000n;
-                    return fee.toString();
-                  } catch { return '0'; }
-                })()
-              }
-            }
+            amount: Number(ctx.amount),
+            note: ctx.note || '',
+            kind: 'request',
+            initData: '',
           }),
         });
         if (!rest.ok) {
@@ -195,13 +317,13 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true, error: t });
         }
         const json = await rest.json();
-        const id = json.paymentReference || json.requestID || json.requestId;
+        const id = json.requestId || json.requestID || json.id;
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const payUrl = `${baseUrl}/pay/${id}`;
-        const keyboard = { inline_keyboard: [[{ text: 'Open', web_app: { url: payUrl } }]] } as any;
+        const openUrl = `${baseUrl}/pay/${id}`;
+        const keyboard = { inline_keyboard: [[{ text: 'Open', web_app: { url: openUrl } }]] } as any;
         await tg.sendMessage(chatId, `Request: $${ctx.amount.toFixed(2)}${ctx.note ? ` — ${ctx.note}` : ''}`,);
         pendingAddressByUser.delete(tgUserId);
-        return NextResponse.json({ ok: true, id, payUrl });
+        return NextResponse.json({ ok: true, id, payUrl: openUrl });
       } catch (err: any) {
         await reply(`Error creating request: ${err?.message || 'unknown'}`);
         pendingAddressByUser.delete(tgUserId);
@@ -209,9 +331,446 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    if (/^\/start/.test(text)) {
-      await reply('Dial Bot ready. Use /pay <to> <amt> or /request <amt>');
+    if (/^\/start\b/.test(text)) {
+      await reply('💎 Dial Crypto Pay Bot\n\n💰 Payments:\n/invoice <amount> <asset> - Create invoice\n/send <user> <amount> <asset> - Send crypto\n/check <amount> <asset> - Create voucher\n/balance - View balance\n\n🎉 Party Lines:\n/startparty - Create party\n/listparty - List parties\n/findparty <keyword> - Search\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
       return NextResponse.json({ ok: true });
+    }
+
+    // /startparty - Create a new party room on dial.wtf
+    if (/^\/startparty\b/i.test(text)) {
+      const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
+      if (!apiKey) {
+        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        return NextResponse.json({ ok: false }, { status: 200 });
+      }
+
+      // Get user's wallet address
+      let owner: string | undefined;
+      const parts = text.split(/\s+/);
+      const providedAddr = parts[1];
+
+      // If user provided an address, use that
+      if (providedAddr && /^0x[0-9a-fA-F]{40}$/i.test(providedAddr)) {
+        owner = providedAddr.toLowerCase();
+      } else {
+        // Try to get from Privy
+        try {
+          const privy = await getPrivyClient();
+          if (privy) {
+            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            const addr = (w as any)?.address as string | undefined;
+            if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) owner = addr;
+          }
+        } catch (err: any) {
+          if (DEBUG) {
+            await reply(`dbg: Privy lookup failed: ${err?.message || 'unknown'}`);
+          }
+        }
+      }
+
+      if (!owner) {
+        await reply('No wallet found. Usage: /startparty <your_wallet_address>\n\nExample: /startparty 0xaA64...337c');
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines', {
+          method: 'POST',
+          headers: {
+            'x-api-key': apiKey,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            owner,
+            telegramUserId: String(tgUserId),
+            telegramChatId: String(chatId),
+          }),
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          await reply(`Failed to create party room: ${response.status} ${response.statusText}`);
+          return NextResponse.json({ ok: false, error });
+        }
+
+        const apiResponse = await response.json();
+        if (DEBUG) {
+          await reply(`dbg: API response: ${JSON.stringify(apiResponse)}`);
+        }
+
+        const data = apiResponse.data || apiResponse;
+        const joinUrl = data.joinUrl;
+        const roomCode = data.roomCode;
+        const partyId = data.id || data.partyLineId || data.contractAddress || data.address;
+
+        if (!joinUrl && !partyId) {
+          await reply(`⚠️ Party room created but no ID or joinUrl returned.`);
+          return NextResponse.json({ ok: true, data: apiResponse });
+        }
+
+        // Replace dial.wtf with staging.dial.wtf in joinUrl
+        const partyLineUrl = joinUrl
+          ? joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/')
+          : `https://staging.dial.wtf/party/${roomCode || partyId}`;
+        const message = `🎉 Party room created!\n\nOwner: ${owner}\nRoom Code: ${roomCode || 'N/A'}`;
+        const keyboard = {
+          inline_keyboard: [[{ text: 'Open Party Room', url: partyLineUrl }]]
+        };
+        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        return NextResponse.json({ ok: true, data: apiResponse });
+      } catch (err: any) {
+        await reply(`Error creating party room: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /listparty - List all open party rooms
+    if (/^\/listparty\b/i.test(text)) {
+      const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
+      if (!apiKey) {
+        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        return NextResponse.json({ ok: false }, { status: 200 });
+      }
+
+      try {
+        // Query all party lines (not just active ones)
+        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines?limit=100', {
+          method: 'GET',
+          headers: {
+            'x-api-key': apiKey,
+          },
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          await reply(`Failed to fetch party rooms: ${response.status} ${response.statusText}`);
+          return NextResponse.json({ ok: false, error });
+        }
+
+        const apiResponse = await response.json();
+
+        if (DEBUG) {
+          const shortResp = JSON.stringify(apiResponse).slice(0, 500);
+          await reply(`dbg: Raw response: ${shortResp}`);
+        }
+
+        // API returns: { success: true, data: { partyLines: [...], pagination: {...} } }
+        const partyLines = apiResponse?.data?.partyLines || [];
+
+        if (DEBUG) {
+          await reply(`dbg: Found ${partyLines.length} party rooms`);
+        }
+
+        if (partyLines.length === 0) {
+          await reply('No open party rooms found. Use /startparty to create one!');
+          return NextResponse.json({ ok: true, data: [] });
+        }
+
+        let message = `🎊 Open Party Rooms (${partyLines.length}):\n\n`;
+        partyLines.slice(0, 10).forEach((party: any, idx: number) => {
+          const roomCode = party.roomCode || 'N/A';
+          const owner = party.owner || 'Unknown';
+          const joinUrl = party.joinUrl ? party.joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/') : '';
+          message += `${idx + 1}. ${roomCode}\n   Owner: ${owner.slice(0, 10)}...${owner.slice(-6)}\n   ${joinUrl}\n\n`;
+        });
+
+        if (partyLines.length > 10) {
+          message += `\n...and ${partyLines.length - 10} more`;
+        }
+
+        await reply(message);
+        return NextResponse.json({ ok: true, data: partyLines });
+      } catch (err: any) {
+        await reply(`Error fetching party rooms: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /findparty <keyword> - Search for a party room by keyword (name, room code, owner, or contract address)
+    if (/^\/findparty\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const searchQuery = parts.slice(1).join(' ').trim();
+
+      if (!searchQuery) {
+        await reply('Usage: /findparty <keyword>\n\nSearch by party name, room code, owner address, or contract address');
+        return NextResponse.json({ ok: true });
+      }
+
+      const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
+      if (!apiKey) {
+        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        return NextResponse.json({ ok: false }, { status: 200 });
+      }
+
+      try {
+        // Use the API's search parameter for server-side filtering
+        const searchUrl = `https://staging.dial.wtf/api/v1/party-lines?search=${encodeURIComponent(searchQuery)}&isActive=true&limit=50`;
+        const response = await fetch(searchUrl, {
+          method: 'GET',
+          headers: {
+            'x-api-key': apiKey,
+          },
+        });
+
+        if (!response.ok) {
+          const error = await response.text();
+          await reply(`Failed to search party rooms: ${response.status} ${response.statusText}`);
+          return NextResponse.json({ ok: false, error });
+        }
+
+        const apiResponse = await response.json();
+        const partyLines = apiResponse?.data?.partyLines || [];
+
+        if (partyLines.length === 0) {
+          await reply(`No party rooms found matching: "${searchQuery}"\n\nTry searching by party name, room code, owner address, or contract address`);
+          return NextResponse.json({ ok: true, data: [] });
+        }
+
+        let message = `🔍 Found ${partyLines.length} matching party room${partyLines.length > 1 ? 's' : ''}:\n\n`;
+        partyLines.slice(0, 5).forEach((party: any, idx: number) => {
+          const name = party.name || party.roomCode || 'Unnamed';
+          const roomCode = party.roomCode || 'N/A';
+          const owner = party.owner || 'Unknown';
+          const contractAddr = party.contractAddress || party.address || 'N/A';
+          const joinUrl = party.joinUrl ? party.joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/') : '';
+          
+          message += `${idx + 1}. ${name}\n`;
+          if (party.name && party.roomCode) message += `   Code: ${roomCode}\n`;
+          message += `   Owner: ${owner.slice(0, 10)}...${owner.slice(-6)}\n`;
+          if (contractAddr !== 'N/A') message += `   Contract: ${contractAddr.slice(0, 10)}...${contractAddr.slice(-6)}\n`;
+          message += `   ${joinUrl}\n\n`;
+        });
+
+        if (partyLines.length > 5) {
+          message += `\n...and ${partyLines.length - 5} more`;
+        }
+
+        await reply(message);
+        return NextResponse.json({ ok: true, data: partyLines });
+      } catch (err: any) {
+        await reply(`Error searching party rooms: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /invoice <amount> <asset> [description] - Create crypto invoice
+    if (/^\/invoice\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const amount = parseFloat(parts[1] || '0');
+      const asset = (parts[2] || 'USDC').toUpperCase();
+      const description = parts.slice(3).join(' ') || undefined;
+
+      if (!amount || amount <= 0) {
+        await reply('Usage: /invoice <amount> <asset> [description]\n\nExample: /invoice 10 USDC Payment for service\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        return NextResponse.json({ ok: true });
+      }
+
+      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      if (!validAssets.includes(asset)) {
+        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        let payee: string | undefined;
+        try {
+          const privy = await getPrivyClient();
+          if (privy) {
+            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            payee = (w as any)?.address as string | undefined;
+          }
+        } catch {}
+
+        if (!payee) {
+          const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+          await reply('No wallet connected. Open the app to connect your wallet first.');
+          return NextResponse.json({ ok: true });
+        }
+
+        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const res = await fetch(`${baseUrl}/api/crypto/invoice`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            currency_type: 'crypto',
+            asset,
+            amount: String(amount),
+            description,
+            payee,
+            telegram_user_id: tgUserId,
+          }),
+        });
+
+        const data = await res.json();
+        if (!data.ok || !data.result) {
+          await reply(`Failed to create invoice: ${data.error || 'unknown error'}`);
+          return NextResponse.json({ ok: false });
+        }
+
+        const invoice = data.result;
+        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
+        const emoji = assetEmojis[asset] || '💰';
+        const message = `${emoji} Invoice Created\n\nAmount: ${amount} ${asset}\n${description ? `Description: ${description}\n` : ''}Status: Active`;
+        
+        const keyboard = {
+          inline_keyboard: [[
+            { text: 'Pay Invoice', url: invoice.pay_url }
+          ]]
+        };
+
+        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        return NextResponse.json({ ok: true, result: invoice });
+      } catch (err: any) {
+        await reply(`Error creating invoice: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /send <user_id|@username> <amount> <asset> [comment] - Send crypto
+    if (/^\/send\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const userTarget = parts[1];
+      const amount = parseFloat(parts[2] || '0');
+      const asset = (parts[3] || 'USDC').toUpperCase();
+      const comment = parts.slice(4).join(' ') || undefined;
+
+      if (!userTarget || !amount || amount <= 0) {
+        await reply('Usage: /send <user_id|@username> <amount> <asset> [comment]\n\nExample: /send @john 5 USDC Thanks!\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        return NextResponse.json({ ok: true });
+      }
+
+      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      if (!validAssets.includes(asset)) {
+        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        return NextResponse.json({ ok: true });
+      }
+
+      const targetUserId = userTarget.startsWith('@') ? null : parseInt(userTarget);
+      if (!targetUserId && !userTarget.startsWith('@')) {
+        await reply('Invalid user. Use user ID or @username');
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const spendId = `spend_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+        
+        const res = await fetch(`${baseUrl}/api/crypto/transfer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_id: targetUserId || 0,
+            asset,
+            amount: String(amount),
+            spend_id: spendId,
+            comment,
+          }),
+        });
+
+        const data = await res.json();
+        if (!data.ok || !data.result) {
+          await reply(`Failed to send: ${data.error || 'unknown error'}`);
+          return NextResponse.json({ ok: false });
+        }
+
+        const transfer = data.result;
+        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
+        const emoji = assetEmojis[asset] || '💰';
+        await reply(`✅ ${emoji} Sent ${amount} ${asset} to ${userTarget}${comment ? `\n\n"${comment}"` : ''}`);
+        return NextResponse.json({ ok: true, result: transfer });
+      } catch (err: any) {
+        await reply(`Error sending: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /check <amount> <asset> [pin_to_user] - Create crypto voucher
+    if (/^\/check\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const amount = parseFloat(parts[1] || '0');
+      const asset = (parts[2] || 'USDC').toUpperCase();
+      const pinTo = parts[3];
+
+      if (!amount || amount <= 0) {
+        await reply('Usage: /check <amount> <asset> [pin_to_user]\n\nExample: /check 10 USDC @john\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        return NextResponse.json({ ok: true });
+      }
+
+      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      if (!validAssets.includes(asset)) {
+        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const payload: any = { asset, amount: String(amount) };
+        
+        if (pinTo) {
+          if (pinTo.startsWith('@')) {
+            payload.pin_to_username = pinTo.substring(1);
+          } else {
+            payload.pin_to_user_id = parseInt(pinTo);
+          }
+        }
+
+        const res = await fetch(`${baseUrl}/api/crypto/check`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await res.json();
+        if (!data.ok || !data.result) {
+          await reply(`Failed to create check: ${data.error || 'unknown error'}`);
+          return NextResponse.json({ ok: false });
+        }
+
+        const check = data.result;
+        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
+        const emoji = assetEmojis[asset] || '💰';
+        const message = `🎁 ${emoji} Crypto Check Created\n\nAmount: ${amount} ${asset}\n${pinTo ? `Pinned to: ${pinTo}\n` : ''}Status: Active`;
+        
+        const keyboard = {
+          inline_keyboard: [[
+            { text: 'Claim Check', url: check.check_url }
+          ]]
+        };
+
+        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        return NextResponse.json({ ok: true, result: check });
+      } catch (err: any) {
+        await reply(`Error creating check: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
+    }
+
+    // /balance - View wallet balance
+    if (/^\/balance\b/i.test(text)) {
+      try {
+        let walletAddr: string | undefined;
+        try {
+          const privy = await getPrivyClient();
+          if (privy) {
+            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            walletAddr = (w as any)?.address as string | undefined;
+          }
+        } catch {}
+
+        if (!walletAddr) {
+          await reply('No wallet connected. Open the app to connect your wallet first.');
+          return NextResponse.json({ ok: true });
+        }
+
+        await reply(`💰 Your Wallet\n\nAddress: ${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}\n\nConnect your wallet in the app to view balances and manage crypto payments.`);
+        return NextResponse.json({ ok: true });
+      } catch (err: any) {
+        await reply(`Error: ${err?.message || 'unknown'}`);
+        return NextResponse.json({ ok: false });
+      }
     }
 
     // /request <amount> [note] [destination]
@@ -229,18 +788,7 @@ export async function POST(req: NextRequest) {
       }
 
       try {
-        const rawBase = (appConfig.request.restBase || 'https://api.request.network');
-        const baseTrim = rawBase.replace(/\/$/, '');
-        const endpoint = /\/v1$/.test(baseTrim)
-          ? `${baseTrim}/request`
-          : /\/v2$/.test(baseTrim)
-          ? `${baseTrim}/request`
-          : `${baseTrim}/v2/request`;
-        const apiKey = appConfig.request.apiKey || process.env.REQUEST_API_KEY;
-        if (!apiKey) {
-          await reply('Server missing REQUEST_API_KEY');
-          return NextResponse.json({ ok: false }, { status: 200 });
-        }
+        const apiBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         // Resolve payee: explicit destination > linked wallet > env fallback
         let payee: string | undefined;
         if (explicitDest) {
@@ -254,13 +802,13 @@ export async function POST(req: NextRequest) {
               const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
               const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
               const addr = (w as any)?.address as string | undefined;
-              if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) payee = addr;
+              if (addr && isValidEthereumAddress(addr)) payee = addr;
               else if ((w as any)?.id) {
                 try {
                   const walletId = (w as any).id as string;
                   const details = await (privy as any).wallets().ethereum().get(walletId);
                   const a = details?.address as string | undefined;
-                  if (a && /^0x[0-9a-fA-F]{40}$/.test(a)) payee = a;
+                  if (a && isValidEthereumAddress(a)) payee = a;
                 } catch {}
               }
             }
@@ -276,104 +824,191 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true });
         }
 
-        const rest = await fetch(endpoint, {
+        let rest: Response;
+        try {
+          if (DEBUG) {
+            try { console.log('[BOT]/request -> POST', `${apiBase}/api/invoice`, { payee, amount: Number(amt), note }); } catch {}
+          }
+          rest = await fetch(`${apiBase}/api/invoice`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json', 'Accept': 'application/json',
-            'x-api-key': apiKey as string,
+            'x-internal': process.env.INTERNAL_API_KEY || '',
           },
           body: JSON.stringify({
             payee,
-            amount: String(amt),
-            invoiceCurrency: 'ETH-mainnet',
-            paymentCurrency: 'ETH-mainnet',
-            reference: note || '',
-            paymentNetwork: {
-              id: 'ETH_FEE_PROXY_CONTRACT',
-              parameters: {
-                paymentNetworkName: 'mainnet',
-                paymentAddress: payee,
-                feeAddress: process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!,
-                feeAmount: (() => {
-                  try {
-                    const bps = Number(process.env.FEE_BPS || '50');
-                    const wei = parseEther(String(amt));
-                    const fee = (wei * BigInt(bps)) / 10000n;
-                    return fee.toString();
-                  } catch { return '0'; }
-                })()
-              }
-            }
+            amount: Number(amt),
+            note,
+            kind: 'request',
+            initData: '',
           }),
         });
+        } catch (err: any) {
+          if (DEBUG) { try { console.warn('[BOT]/request fetch /api/invoice failed:', err?.message || err); } catch {} }
+          throw err;
+        }
         if (!rest.ok) {
-          const t = await rest.text();
+          const t = await rest.text().catch(() => '');
+          if (DEBUG) { try { console.warn('[BOT]/request invoice non-OK:', rest.status, rest.statusText, t.slice(0, 300)); } catch {} }
           await reply(`Failed to create invoice: ${rest.status} ${rest.statusText}`);
           return NextResponse.json({ ok: true, error: t });
         }
-        const json = await rest.json();
-        const id = json.requestID || json.requestId || json.id;
-        const paymentReference: string | undefined = json.paymentReference || json.reference || json.payment_reference;
+        const json = await rest.json().catch(() => ({} as any));
+        if (DEBUG) { try { console.log('[BOT]/request invoice OK response keys:', Object.keys(json || {})); } catch {} }
+        const id = json.requestId || json.requestID || json.id;
         if (!id) {
           await reply('Invoice created but id missing');
           return NextResponse.json({ ok: true });
         }
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const payUrl = `${baseUrl}/pay/${id}`;
+        const invUrl = `${baseUrl}/pay/${id}`;
 
-        // Build an EIP-681 ETH URI to the ETH Fee Proxy if configured
-        const amountWei = parseEther(String(amt));
-        const feeBps = Number(process.env.FEE_BPS || '50');
-        const feeWei = (amountWei * BigInt(feeBps)) / 10000n;
-        const feeAddr = process.env.FEE_ADDRESS || appConfig.feeAddr || appConfig.payeeAddr!;
-        const proxy = process.env.ETH_FEE_PROXY_ADDRESS; // set this for mainnet to get wallet-pay QR
-
+        // Build QR using forwarder prediction (Create2) for improved wallet compatibility
         let ethUri: string | undefined;
-        if (proxy && paymentReference) {
+        let savedInvoiceIndexKey: string | undefined;
+        try {
+          const feeAddress = process.env.FEE_ADDRESS || appConfig.feeAddr || undefined;
+          const feePercentage = feeAddress ? bpsToPercentString(process.env.FEE_BPS || '50') : undefined;
+          if (DEBUG) { try { console.log('[BOT]/request fetching pay calldata for id=', id); } catch {} }
+          const payJson = await fetchPayCalldata(id, { feeAddress, feePercentage, apiKey: appConfig.request.apiKey || process.env.REQUEST_API_KEY });
+          if (DEBUG) { try { console.log('[BOT]/request pay transactions:', Array.isArray((payJson as any)?.transactions) ? (payJson as any).transactions.length : 0); } catch {} }
+          const fwd = extractForwarderInputs(payJson);
+          if (DEBUG) { try { console.log('[BOT]/request forwarder inputs:', { proxy: fwd.requestProxy, to: fwd.beneficiary, feeAddress: fwd.feeAddress, feeAmountWei: String(fwd.feeAmountWei), hasAmount: typeof fwd.amountWei === 'bigint' }); } catch {} }
+
+          // Compute network id and CreateX config
+          const chainKey = String(appConfig.request.chain || '').toLowerCase();
+          const NETWORK_ID_BY_CHAIN: Record<string, string> = { base: '8453', ethereum: '1', mainnet: '1', sepolia: '11155111' };
+          const networkId = process.env.TENDERLY_NETWORK_ID || NETWORK_ID_BY_CHAIN[chainKey] || '1';
+          const createx = (process.env.CREATEX_ADDRESS || process.env.CREATE_X || '').trim() as `0x${string}`;
+          const from = (process.env.TENDERLY_FROM || process.env.CREATEX_FROM || '').trim() as `0x${string}`;
+          if (!/^0x[0-9a-fA-F]{40}$/.test(createx)) throw new Error('Missing CREATEX_ADDRESS');
+          if (!/^0x[0-9a-fA-F]{40}$/.test(from)) throw new Error('Missing TENDERLY_FROM');
+
+          // Salt ties deposit address to request id and chain
+          const salt = keccak256(toHex(`DIAL|${id}|${networkId}`)) as `0x${string}`;
+          const predictInput = buildPredictTenderlyInput({
+            networkId,
+            createx,
+            from,
+            requestProxy: fwd.requestProxy,
+            beneficiary: fwd.beneficiary,
+            paymentReferenceHex: fwd.paymentReferenceHex,
+            feeAmountWei: fwd.feeAmountWei,
+            feeAddress: fwd.feeAddress,
+            salt,
+            artifact: { bytecode: (ForwarderArtifact as any)?.bytecode as `0x${string}` },
+          });
+          if (DEBUG) { try { console.log('[BOT]/request predict input:', { networkId, createx, from, salt: predictInput.salt.slice(0,10)+'…', initCodeLen: predictInput.initCode.length }); } catch {} }
+          const { predicted } = await predictDestinationTenderly(predictInput);
+          if (DEBUG) { try { console.log('[BOT]/request predicted address:', predicted); } catch {} }
+          if (predicted && fwd.amountWei && fwd.amountWei > 0n) {
+            const decVal = fwd.amountWei.toString(10);
+            // Save predict context for webhook
+            try {
+              predictContextByAddress.set(String(predicted).toLowerCase(), {
+                networkId,
+                createx,
+                salt: predictInput.salt,
+                initCode: predictInput.initCode,
+                from,
+              });
+              requestIdByPredictedAddress.set(String(predicted).toLowerCase(), id);
+            } catch {}
+            // Persist invoice metadata to S3 for later lookup by predicted address
+            try {
+              const tgUserName: string = (msg?.from?.username || '').toString();
+              const lowerPred = String(predicted).toLowerCase();
+              const fileName = `invoice-${lowerPred}-${tgUserName || 'anon'}-${id}.json`;
+              const s3Key = `${PATH_INVOICES}${fileName}`;
+              savedInvoiceIndexKey = s3Key;
+              const scanUrl = `https://scan.request.network/request/${id}`;
+              const chainIdNum = Number(networkId) || 1;
+              const payUri = buildEthereumUri({ to: String(predicted), valueWeiDec: decVal, chainId: chainIdNum });
+              const record = {
+                requestId: id,
+                networkId,
+                predictedAddress: String(predicted),
+                salt: predictInput.salt,
+                initCode: predictInput.initCode,
+                requestProxy: fwd.requestProxy,
+                beneficiary: fwd.beneficiary,
+                paymentReferenceHex: fwd.paymentReferenceHex,
+                feeAmountWei: fwd.feeAmountWei.toString(),
+                feeAddress: fwd.feeAddress,
+                amountWei: decVal,
+                ethereumUri: payUri,
+                requestScanUrl: scanUrl,
+                telegram: {
+                  chatId,
+                  chatType,
+                  userId: tgUserId,
+                  username: tgUserName || undefined,
+                  commandText: text,
+                },
+                createdAt: new Date().toISOString(),
+              } as const;
+              const body = Buffer.from(JSON.stringify(record, null, 2));
+              await writeS3File(s3Key, { Body: body, ContentType: 'application/json' });
+              if (DEBUG) { try { console.log('[BOT]/request saved invoice json to S3:', s3Key); } catch {} }
+            } catch (e) {
+              if (DEBUG) { try { console.warn('[BOT]/request failed to save invoice S3:', (e as any)?.message || e); } catch {} }
+            }
+            // Register address activity on Alchemy webhook (create once, then update addresses)
+            try {
+              const alchemyWebhookId = process.env.ALCHEMY_WEBHOOK_ID;
+              if (alchemyWebhookId) {
+                await updateWebhookAddresses({ webhookId: alchemyWebhookId, add: [predicted as `0x${string}`], remove: [] });
+                if (DEBUG) {
+                  try { console.log('[BOT]/request alchemy: added address to webhook', { webhookId: alchemyWebhookId, address: predicted }); } catch {}
+                }
+              } else {
+                const created = await createAddressActivityWebhook({ addresses: [predicted as `0x${string}`] });
+                if (DEBUG) {
+                  try { console.log('[BOT]/request alchemy: created webhook', created); } catch {}
+                }
+              }
+            } catch (e) {
+              if (DEBUG) { try { console.warn('[BOT] alchemy webhook setup failed', { error: (e as any)?.message || e }); } catch {} }
+            }
+            // Action registration temporarily disabled; focusing on alert only
+
+            // Build direct ETH URI to pay predicted deposit address
+            const chainIdNum = Number(networkId) || 1;
+            ethUri = buildEthereumUri({ to: predicted, valueWeiDec: decVal, chainId: chainIdNum });
+            if (DEBUG && ethUri) { try { console.log('[BOT] built ethUri (predict):', ethUri); } catch {} }
+          }
+        } catch (e) {
+          if (DEBUG) { try { console.warn('[BOT] forwarder predict failed; fallback to invoice link', (e as any)?.message || e); } catch {} }
+        }
+        const { qrUrl, caption, keyboard, payUrl: builtPayUrl } = buildQrForRequest(baseUrl, id, ethUri, amt, note || '');
+        const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
+        const messageId = sent?.result?.message_id as number | undefined;
+        if (messageId) {
           try {
-            const iface = new Interface([
-              'function transferWithReferenceAndFee(address to, bytes reference, uint256 fee, address feeAddress)'
-            ]);
-            const data = iface.encodeFunctionData('transferWithReferenceAndFee', [payee, paymentReference, feeWei, feeAddr]);
-            ethUri = `ethereum:${proxy}?value=${amountWei.toString()}&data=${data}`;
+            requestContextById.set(id, {
+              chatId: Number(chatId),
+              messageId: Number(messageId),
+              paidCaption: `✅ PAID — $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`,
+              replyMarkup: keyboard,
+            });
+          } catch {}
+          // Write by-request index to S3 for webhook lookup
+          try {
+            const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
+            const idxPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
+            await writeS3File(idxKey, { Body: idxPayload, ContentType: 'application/json' });
+            if (DEBUG) { try { console.log('[BOT]/request wrote index file:', idxKey); } catch {} }
+          } catch {}
+          // Write by-message index to S3 for status callback lookup
+          try {
+            const byMsgKey = `${PATH_INVOICES}by-message/${chatId}/${messageId}.json`;
+            const byMsgPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
+            await writeS3File(byMsgKey, { Body: byMsgPayload, ContentType: 'application/json' });
+            if (DEBUG) { try { console.log('[BOT]/request wrote by-message index file:', byMsgKey); } catch {} }
           } catch {}
         }
-        // Fallback: simple ETH transfer URI to payee if proxy/reference not available
-        if (!ethUri && payee) {
-          ethUri = `ethereum:${payee}?value=${amountWei.toString()}`;
-        }
-        const base = appConfig.publicBaseUrl || '';
-        const scanUrl = `https://scan.request.network/request/${id}`;
-        const qrPayload = ethUri || payUrl; // prefer wallet-pay if available, otherwise app link
-        const qrApi = `${baseUrl.replace(/\/$/, '')}/api/qr`;
-        const qrUrl = `${qrApi}?size=720&data=${encodeURIComponent(qrPayload)}&logo=/phone-logo-no-bg.png&bg=%23F8F6FF&grad1=%237C3AED&grad2=%23C026D3&footerH=180&wordmark=/Dial.letters.transparent.bg.crop.png`;
-        const caption = `Request: $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`;
-        // Buttons: Only https URLs (Telegram rejects ethereum: links in buttons)
-        const topRow: any[] = [{ text: 'Open invoice', url: payUrl }];
-        if (ethUri) topRow.push({ text: 'Pay in wallet', url: `${baseUrl.replace(/\/$/, '')}/paylink?uri=${encodeURIComponent(ethUri)}` });
-        const scanRow: any[] = [{ text: 'View on Request Scan', url: scanUrl }];
-        const statusRow: any[] = [{ text: 'Status: Pending', callback_data: 'status_pending', sticker: 'ABCEmoji' }];
-        const keyboard = { inline_keyboard: [topRow, scanRow, statusRow] } as any;
-        const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
 
-        // Poll and update caption to ✅ PAID
-        const messageId = sent?.result?.message_id as number | undefined;
-        (async () => {
-          if (!messageId) return;
-          for (let i = 0; i < 24; i++) {
-            try {
-              await new Promise(r => setTimeout(r, 5000));
-              const s = await fetch(`${baseUrl}/api/status?id=${id}`).then(r => r.json());
-              if (s?.status === 'paid') {
-                const paidCaption = `✅ PAID — $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`;
-                await tg.editCaption(chatId, messageId, paidCaption, keyboard);
-                break;
-              }
-            } catch {}
-          }
-        })();
-
-        return NextResponse.json({ ok: true, id, payUrl });
+        return NextResponse.json({ ok: true, id, payUrl: builtPayUrl || invUrl });
       } catch (err: any) {
         await reply(`Error creating request: ${err?.message || 'unknown'}`);
         return NextResponse.json({ ok: false });

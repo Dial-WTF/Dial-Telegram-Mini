@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import BottomNav from "@/components/BottomNav";
+import BottomNav from "#/components/BottomNav";
 
 export default function PayPage() {
   const [status, setStatus] = useState<"pending" | "paid" | "error">("pending");

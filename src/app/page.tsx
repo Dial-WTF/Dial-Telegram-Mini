@@ -3,7 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import { usePrivy, useWallets, useFundWallet } from "@privy-io/react-auth"; // embedded wallet & funding
-import BottomNav from "@/components/BottomNav";
+import BottomNav from "#/components/BottomNav";
+import { useTelegramWebApp } from "#/lib/hooks/useTelegram";
+import { usePayeeAddress } from "#/lib/hooks/usePayeeAddress";
+import { OnrampModal } from "#/components/OnrampModal";
 
 // Dial retro neon theme (purple)
 const t = {
@@ -18,6 +21,20 @@ const t = {
 };
 
 type Kind = "request" | "send";
+type Asset = "USDT" | "USDC" | "ETH" | "BTC" | "TON" | "BNB" | "SOL";
+type Network = "ETH" | "BASE" | "BNB" | "POLYGON" | "ARBITRUM" | "OPTIMISM" | "SOLANA" | "BITCOIN" | "LIGHTNING";
+
+const NETWORK_INFO: Record<Network, { name: string; emoji: string; color: string }> = {
+  BASE: { name: "Base", emoji: "🔵", color: "#0052FF" },
+  ETH: { name: "Ethereum", emoji: "Ξ", color: "#627EEA" },
+  SOLANA: { name: "Solana", emoji: "◎", color: "#14F195" },
+  POLYGON: { name: "Polygon", emoji: "🟣", color: "#8247E5" },
+  BNB: { name: "BNB Chain", emoji: "🟡", color: "#F3BA2F" },
+  ARBITRUM: { name: "Arbitrum", emoji: "🔷", color: "#28A0F0" },
+  OPTIMISM: { name: "Optimism", emoji: "🔴", color: "#FF0420" },
+  BITCOIN: { name: "Bitcoin", emoji: "₿", color: "#F7931A" },
+  LIGHTNING: { name: "Lightning", emoji: "⚡", color: "#FFD700" },
+};
 
 export default function Home() {
   // Preferred onramp provider from env (build-time). Set NEXT_PUBLIC_ONRAMP=COINBASE or MOONPAY
@@ -26,11 +43,15 @@ export default function Home() {
   const onrampPath = preferredProvider === "moonpay" ? "/api/onramp/moonpay" : "/api/onramp/coinbase";
   const [onrampUrl, setOnrampUrl] = useState<string | null>(null);
   const [amount, setAmount] = useState<string>("1.00");
+  const [recipient, setRecipient] = useState<string>("");
   const [note, setNote] = useState<string>("");
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>("");
+  const [selectedAsset, setSelectedAsset] = useState<Asset>("USDC");
+  const [selectedNetwork, setSelectedNetwork] = useState<Network>("BASE");
 
-  // Telegram WebApp SDK ref (loaded dynamically)
-  const tgRef = useRef<any>(null);
+  // Telegram WebApp SDK
+  const tgRef = useTelegramWebApp();
 
   // Privy embedded wallet (optional payee)
   const { wallets } = useWallets();
@@ -53,22 +74,7 @@ export default function Home() {
       : undefined;
   }
 
-  // Load Telegram SDK only on the client
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      if (typeof window === "undefined") return;
-      const mod = await import("@twa-dev/sdk"); // <-- dynamic import avoids SSR crash
-      if (!mounted) return;
-      tgRef.current = mod.default;
-      tgRef.current.ready();
-      tgRef.current.expand();
-      tgRef.current.enableClosingConfirmation();
-    })();
-    return () => {
-      mounted = false;
-    };
-  }, []);
+  // Telegram SDK loaded via hook
 
   const bump = (delta: number) => {
     setAmount((a) => {
@@ -165,36 +171,67 @@ export default function Home() {
 
   async function create(kind: Kind) {
     const tg = tgRef.current;
+    setError("");
+    
+    // Validation
+    if (!amount || parseFloat(amount) <= 0) {
+      setError("Please enter a valid amount");
+      return;
+    }
+    
+    // Validate recipient address for EVM chains
+    if (recipient && ['ETH', 'BASE', 'POLYGON', 'BNB', 'ARBITRUM', 'OPTIMISM'].includes(selectedNetwork)) {
+      if (!/^0x[0-9a-fA-F]{40}$/.test(recipient)) {
+        setError("Please enter a valid address (0x...)");
+        return;
+      }
+    }
+    
     try {
       setLoading(true);
       await ensureWallet();
       const currentPayee = await waitForPayeeAddress();
-      const res = await fetch("/api/invoice", {
+      
+      // Use new crypto invoice API
+      const res = await fetch("/api/crypto/invoice", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          kind,
+          currency_type: "crypto",
+          asset: selectedAsset,
           amount: Number(amount),
-          note,
-          initData: (tg && tg.initData) || "", // pass Telegram launch params if present
-          payee: currentPayee, // Privy wallet (server will fallback if undefined)
+          description: note || undefined,
+          payee: recipient || currentPayee, // Use recipient if provided, otherwise use connected wallet
+          network: selectedNetwork,
         }),
       });
       const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      if (!data.ok || !data.result) {
+        throw new Error(data.error || "Failed to create invoice");
+      }
+      
+      const invoice = data.result;
       // Share link back to chat (preferred), fallback to opening
       if (tg?.shareURL && typeof tg.shareURL === 'function') {
-        const text = `Request: $${Number(amount).toFixed(2)}${note ? ` — ${note}` : ''}`;
+        const assetEmojis: Record<Asset, string> = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎' };
+        const emoji = assetEmojis[selectedAsset] || '💰';
+        const text = `${emoji} ${kind === 'request' ? 'Request' : 'Send'}: ${Number(amount).toFixed(2)} ${selectedAsset}${note ? ` — ${note}` : ''}`;
         try {
-          await tg.shareURL(data.payUrl, { text });
+          await tg.shareURL(invoice.pay_url, { text });
         } catch {
-          tg?.openLink?.(data.payUrl);
+          tg?.openLink?.(invoice.pay_url);
         }
       } else {
-        tg?.openLink?.(data.payUrl);
+        tg?.openLink?.(invoice.pay_url);
       }
     } catch (e: any) {
-      alert(e.message ?? "Failed to create invoice");
+      const errorMsg = e.message ?? "Failed to create invoice";
+      setError(errorMsg);
+      if (tg?.showAlert) {
+        tg.showAlert(errorMsg);
+      } else {
+        alert(errorMsg);
+      }
     } finally {
       setLoading(false);
     }
@@ -206,174 +243,258 @@ export default function Home() {
       style={{ background: t.bg, color: t.text }}
     >
       <div
-        className="w-full max-w-md relative p-4 sm:p-5 rounded-3xl flex flex-col"
+        className="w-full max-w-md relative p-3 rounded-3xl flex flex-col max-h-[100dvh]"
         style={{
           background: t.card,
           boxShadow: t.glow,
           border: t.border,
         }}
       >
-        <div className="flex-1 overflow-y-auto overscroll-contain">
-        <header className="mb-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div
-                className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
-                style={{ background: "#2b1b4b", color: t.text, border: t.border }}
-              >
-                {(user?.email?.address?.[0] || "D").toUpperCase()}
-              </div>
-              <div className="text-sm">
-                <div className="font-semibold">Profile</div>
-                <div className="opacity-70" style={{ color: t.sub }}>
-                  Dial Pay Mini App
-                </div>
-              </div>
+        <div className="flex-1 overflow-y-auto overscroll-contain space-y-3">
+        {/* Header */}
+        <header className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div
+              className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
+              style={{ background: "linear-gradient(135deg, #2b1b4b, #1a0f2e)", color: t.text, border: t.border }}
+            >
+              {(user?.email?.address?.[0] || payee?.[2] || "D").toUpperCase()}
             </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={onFund}
-                className="px-2.5 py-1 rounded-lg text-xs font-bold text-white"
-                style={{ background: t.accent2 }}
-              >
-                Add funds
-              </button>
-              {authenticated ? (
-                <button
-                  onClick={() => logout()}
-                  className="px-2.5 py-1 rounded-lg text-xs font-bold text-white"
-                  style={{ background: "#1f2937" }}
-                >
-                  Sign out
-                </button>
-              ) : (
-                <button
-                  onClick={() => login()}
-                  className="px-2.5 py-1 rounded-lg text-xs font-bold text-white"
-                  style={{ background: t.accent1 }}
-                >
-                  Sign in
-                </button>
+            <div>
+              <div className="font-bold text-xs">Dial Pay</div>
+              {payee && (
+                <div className="text-[10px] font-mono" style={{ color: t.sub }}>
+                  {payee.slice(0, 4)}...{payee.slice(-3)}
+                </div>
               )}
             </div>
           </div>
-          {payee ? (
-            <p className="mt-1 text-xs opacity-70">
-              Receiving to: {payee.slice(0, 6)}…{payee.slice(-4)}
-            </p>
-          ) : null}
+          <div className="flex items-center gap-1.5">
+            {authenticated ? (
+              <>
+                <button
+                  onClick={onFund}
+                  className="px-2.5 py-1 rounded-lg text-[10px] font-bold text-white transition-all active:scale-95"
+                  style={{ background: t.accent2 }}
+                >
+                  +Add
+                </button>
+                <button
+                  onClick={() => logout()}
+                  className="px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all active:scale-95"
+                  style={{ background: "rgba(255,255,255,0.1)", color: t.sub }}
+                >
+                  Out
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => login()}
+                className="px-3 py-1 rounded-lg text-[10px] font-bold text-white transition-all active:scale-95"
+                style={{ background: t.accent1 }}
+              >
+                Connect
+              </button>
+            )}
+          </div>
         </header>
 
-        <section className="flex flex-col items-center text-center select-none">
-          <Image
-            src="/phone.logo.no.bg.png"
-            alt="Dial"
-            width={170}
-            height={170}
-            priority
-            className="drop-shadow-[0_10px_40px_rgba(124,58,237,.35)]"
-          />
-
-          <div className="text-[40px] sm:text-[56px] leading-none font-black tracking-tight mt-2">
-            ${amount}
+        {/* Amount Section */}
+        <section className="space-y-2">
+          <div className="text-center">
+            <Image
+              src="/phone.logo.no.bg.png"
+              alt="Dial"
+              width={80}
+              height={80}
+              priority
+              className="mx-auto drop-shadow-[0_10px_40px_rgba(124,58,237,.35)]"
+            />
           </div>
-          <p className="text-sm mt-2" style={{ color: t.sub }}>
-            Request or send payments instantly in Telegram
-          </p>
 
-          <div className="flex justify-center gap-3 mt-3">
-            <button
-              onClick={() => bump(-1)}
-              className="px-4 py-2 rounded-full font-bold text-white active:scale-95"
-              style={{ background: t.accent1 }}
-            >
-              –1
-            </button>
-            <button
-              onClick={() => bump(1)}
-              className="px-4 py-2 rounded-full font-bold text-white active:scale-95"
-              style={{ background: t.accent1 }}
-            >
-              +1
-            </button>
+          {/* Amount Input */}
+          <div className="text-center">
+            <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
+              Amount
+            </label>
+            <div className="inline-flex items-center gap-2 px-4 py-2 rounded-xl" style={{ background: 'rgba(255,255,255,0.95)', border: '1px solid rgba(124,58,237,0.3)' }}>
+              <input
+                type="number"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                className="text-3xl sm:text-4xl leading-none font-black tracking-tight bg-transparent outline-none text-center w-28 sm:w-36"
+                style={{ color: '#1a0f2e' }}
+                placeholder="Enter amount"
+                step="0.01"
+                min="0"
+              />
+              <div className="text-xl sm:text-2xl font-bold" style={{ color: t.accent1 }}>
+                {selectedAsset}
+              </div>
+            </div>
+          </div>
+
+          {/* Quick Amount Buttons */}
+          <div className="grid grid-cols-4 gap-1.5">
+            {[1, 5, 10, 50].map((val) => (
+              <button
+                key={val}
+                onClick={() => setAmount(String(val))}
+                className="py-1.5 rounded-lg text-xs font-bold text-white transition-all active:scale-95"
+                style={{ 
+                  background: amount === String(val) ? t.accent1 : 'rgba(124,58,237,0.25)', 
+                  border: amount === String(val) ? t.border : '1px solid rgba(124,58,237,0.3)' 
+                }}
+              >
+                {val}
+              </button>
+            ))}
+          </div>
+
+          {/* Asset Selector */}
+          <div>
+            <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
+              Asset
+            </label>
+            <div className="relative">
+              <select
+                value={selectedAsset}
+                onChange={(e) => setSelectedAsset(e.target.value as Asset)}
+                className="w-full p-2.5 rounded-lg text-sm font-bold appearance-none cursor-pointer transition-all"
+                style={{
+                  background: 'rgba(124,58,237,0.15)',
+                  border: '1px solid rgba(124,58,237,0.35)',
+                  color: t.text,
+                  paddingRight: '2.5rem',
+                }}
+              >
+                {(['USDC', 'USDT', 'ETH', 'BTC', 'TON', 'BNB', 'SOL'] as Asset[]).map((asset) => {
+                  const assetEmojis: Record<Asset, string> = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎' };
+                  return (
+                    <option key={asset} value={asset}>
+                      {assetEmojis[asset]} {asset}
+                    </option>
+                  );
+                })}
+              </select>
+              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: t.sub }}>
+                ▼
+              </div>
+            </div>
+          </div>
+
+          {/* Network Selector */}
+          <div>
+            <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
+              Network
+            </label>
+            <div className="relative">
+              <select
+                value={selectedNetwork}
+                onChange={(e) => setSelectedNetwork(e.target.value as Network)}
+                className="w-full p-2.5 rounded-lg text-sm font-bold appearance-none cursor-pointer transition-all"
+                style={{
+                  background: 'rgba(124,58,237,0.15)',
+                  border: '1px solid rgba(124,58,237,0.35)',
+                  color: t.text,
+                  paddingRight: '2.5rem',
+                }}
+              >
+                {(['BASE', 'ETH', 'SOLANA', 'POLYGON', 'BNB', 'ARBITRUM', 'OPTIMISM', 'BITCOIN', 'LIGHTNING'] as Network[]).map((network) => {
+                  const info = NETWORK_INFO[network];
+                  return (
+                    <option key={network} value={network}>
+                      {info.emoji} {info.name}
+                    </option>
+                  );
+                })}
+              </select>
+              <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: t.sub }}>
+                ▼
+              </div>
+            </div>
           </div>
         </section>
 
-        <input
-          type="text"
-          placeholder="Add note (optional)"
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          className="w-full p-3 rounded-xl mt-3 bg-black/30 outline-none"
-          style={{ border: "1px solid #163a29", color: t.text }}
-        />
-
-        <div className="grid grid-cols-2 gap-3 mt-3">
-          <button
-            disabled={loading}
-            onClick={() => create("request")}
-            className="py-3 rounded-xl font-bold text-white active:scale-95 disabled:opacity-60"
-            style={{ background: t.accent1 }}
-          >
-            Request
-          </button>
-          <button
-            disabled={loading}
-            onClick={() => create("send")}
-            className="py-3 rounded-xl font-bold text-white active:scale-95 disabled:opacity-60"
-            style={{ background: t.accent2 }}
-          >
-            Send
-          </button>
-        </div>
-        </div>
-
-        <BottomNav className="mt-2 shrink-0" />
-
-        {onrampUrl ? (
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70"
-            role="dialog"
-            aria-modal="true"
-          >
-            <div className="w-[92vw] max-w-xl h-[80vh] bg-black rounded-2xl overflow-hidden border" style={{ borderColor: '#163a29' }}>
-              <div className="flex items-center justify-between px-3 py-2 text-xs" style={{ color: t.sub, background: '#0b1610' }}>
-                <span>Secure funding</span>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => {
-                      const url = onrampUrl;
-                      if (!url) return;
-                      const tg = (tgRef as any)?.current;
-                      if (tg?.openLink && typeof tg.openLink === 'function') {
-                        try { tg.openLink(url); return; } catch {}
-                      }
-                      window.open(url, '_blank');
-                    }}
-                    className="px-2 py-1 rounded-md font-semibold"
-                    style={{ background: '#12331f', color: t.text }}
-                  >
-                    Open in browser
-                  </button>
-                  <button
-                    onClick={() => setOnrampUrl(null)}
-                    className="px-2 py-1 rounded-md font-semibold"
-                    style={{ background: '#1f2937', color: t.text }}
-                  >
-                    Close
-                  </button>
-                </div>
-              </div>
-              <iframe
-                key={onrampUrl}
-                src={onrampUrl}
-                title="Onramp"
-                className="w-full h-full"
-                allow="accelerometer; autoplay; camera; gyroscope; payment *; clipboard-write; encrypted-media"
-              />
+        {/* Recipient Address Input */}
+        <div>
+          <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
+            Recipient Address (Optional)
+          </label>
+          <input
+            type="text"
+            placeholder="0x... or leave empty to use your wallet"
+            value={recipient}
+            onChange={(e) => setRecipient(e.target.value)}
+            className="w-full p-2 rounded-lg bg-black/20 outline-none transition-all focus:bg-black/30 text-xs font-mono"
+            style={{ 
+              border: `1px solid rgba(124,58,237,0.3)`, 
+              color: t.text,
+              ...(recipient && !/^0x[0-9a-fA-F]{40}$/.test(recipient) && ['ETH', 'BASE', 'POLYGON', 'BNB', 'ARBITRUM', 'OPTIMISM'].includes(selectedNetwork) ? {
+                borderColor: 'rgba(239,68,68,0.6)',
+              } : {})
+            }}
+          />
+          {recipient && !/^0x[0-9a-fA-F]{40}$/.test(recipient) && ['ETH', 'BASE', 'POLYGON', 'BNB', 'ARBITRUM', 'OPTIMISM'].includes(selectedNetwork) && (
+            <div className="text-[9px] mt-1" style={{ color: '#fca5a5' }}>
+              Invalid address format
             </div>
+          )}
+        </div>
+
+        {/* Note Input */}
+        <div>
+          <label className="text-[10px] font-semibold uppercase tracking-wider mb-1 block" style={{ color: t.sub }}>
+            Note (Optional)
+          </label>
+          <input
+            type="text"
+            placeholder="Payment for..."
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            className="w-full p-2 rounded-lg bg-black/20 outline-none transition-all focus:bg-black/30 text-sm"
+            style={{ border: `1px solid rgba(124,58,237,0.3)`, color: t.text }}
+            maxLength={50}
+          />
+        </div>
+
+        {/* Error Message */}
+        {error && (
+          <div className="p-2 rounded-lg text-xs text-center" style={{ background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.4)', color: '#fca5a5' }}>
+            {error}
           </div>
-        ) : null}
+        )}
+
+        {/* Action Buttons */}
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            disabled={loading || !amount || parseFloat(amount) <= 0}
+            onClick={() => create("request")}
+            className="py-2.5 rounded-lg text-sm font-bold text-white transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{ 
+              background: `linear-gradient(135deg, ${t.accent1} 0%, ${t.accent1}dd 100%)`,
+              boxShadow: loading ? 'none' : '0 4px 20px rgba(124,58,237,0.4)',
+            }}
+          >
+            {loading ? '⚡ Creating...' : '📨 Request'}
+          </button>
+          <button
+            disabled={loading || !amount || parseFloat(amount) <= 0}
+            onClick={() => create("send")}
+            className="py-2.5 rounded-lg text-sm font-bold text-white transition-all active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{ 
+              background: `linear-gradient(135deg, ${t.accent2} 0%, ${t.accent2}dd 100%)`,
+              boxShadow: loading ? 'none' : '0 4px 20px rgba(192,38,211,0.4)',
+            }}
+          >
+            {loading ? '⚡ Creating...' : '⚡ Send'}
+          </button>
+        </div>
+        </div>
+
+        <BottomNav className="mt-1.5 shrink-0" />
+
+        {onrampUrl ? (<OnrampModal url={onrampUrl} onClose={() => setOnrampUrl(null)} />) : null}
       </div>
     </main>
   );
@@ -389,3 +510,6 @@ function Pill({ label, bg }: { label: string; bg: string }) {
     </span>
   );
 }
+
+
+
