@@ -14,8 +14,11 @@ import { keccak256, toHex } from 'viem';
 import { estimateGasAndPrice } from '#/lib/gas';
 import { buildQrForRequest } from '#/lib/qrUi';
 import { isValidEthereumAddress } from '#/lib/utils';
-import { requestContextById, predictContextByAddress } from '#/lib/mem';
+import { requestContextById, predictContextByAddress, requestIdByPredictedAddress } from '#/lib/mem';
 import { writeFile as writeS3File } from '#/services/s3/actions/writeFile';
+import { s3 } from '#/services/s3/client';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { AWS_S3_BUCKET } from '#/config/constants';
 import { PATH_INVOICES } from '#/services/s3/filepaths';
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
@@ -73,6 +76,139 @@ async function getPrivyClient() {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    // Handle callback queries for status refresh
+    const callback = body?.callback_query;
+    if (callback && callback.id && callback.message && typeof callback.data === 'string') {
+      const chatIdCb = callback.message.chat?.id;
+      const messageIdCb = callback.message.message_id;
+      const data = callback.data as string;
+      // Data may be very short; derive reqId from original message entities/URLs
+      if (data === 'sr' && chatIdCb && messageIdCb) {
+        // Derive requestId from message content
+        let reqId = '';
+        try {
+          const entities = (callback.message as any).caption_entities || callback.message.entities || [];
+          const text: string = callback.message.caption || callback.message.text || '';
+          for (const ent of entities) {
+            const t = ent.type;
+            if (t === 'text_link' && ent.url) {
+              const m = ent.url.match(/\/pay\/([^/?#]+)/);
+              if (m) { reqId = m[1]; break; }
+            }
+          }
+          if (!reqId) {
+            const m2 = text.match(/https?:\/\/[^\s]+\/pay\/([^\s]+)/);
+            if (m2) reqId = m2[1];
+          }
+          // Fallback: scan reply_markup button URLs
+          if (!reqId) {
+            try {
+              const rm: any = (callback.message as any)?.reply_markup;
+              const rows: any[] = Array.isArray(rm?.inline_keyboard) ? rm.inline_keyboard : [];
+              for (const row of rows) {
+                for (const btn of row) {
+                  const u: string | undefined = btn?.url;
+                  if (u && typeof u === 'string') {
+                    let m = u.match(/\/pay\/([^\/?#]+)/);
+                    if (m) { reqId = m[1]; break; }
+                    m = u.match(/scan\.request\.network\/request\/([^\/?#]+)/);
+                    if (m) { reqId = m[1]; break; }
+                  }
+                }
+                if (reqId) break;
+              }
+            } catch {}
+          }
+          if (!reqId) throw new Error('request id not found');
+        } catch (err: any) {
+          // Fallback: look up requestId by chatId/messageId from S3 index
+          try {
+            const key = `${PATH_INVOICES}by-message/${chatIdCb}/${messageIdCb}.json`;
+            const obj = await s3.send(new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key }));
+            const text = await (obj.Body as any).transformToString();
+            const rec = JSON.parse(text || '{}');
+            const rid = rec?.requestId || rec?.id;
+            if (rid && typeof rid === 'string') {
+              reqId = rid;
+            } else {
+              throw new Error('request id not found');
+            }
+          } catch (e) {
+            await tg.answerCallback(callback.id, 'Unable to refresh status');
+            return NextResponse.json({ ok: false });
+          }
+        }
+        try {
+          const base = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+          const url = `${base}/api/status?id=${encodeURIComponent(reqId)}`;
+          let s: any = null;
+          try {
+            const resp = await fetch(url);
+            const txt = await resp.text();
+            try { s = JSON.parse(txt); } catch { s = { status: resp.ok ? 'pending' : 'error', error: txt.slice(0, 200) }; }
+          } catch (netErr: any) {
+            throw new Error(`status fetch failed: ${netErr?.message || 'network'}`);
+          }
+          const status = String(s?.status || 'pending');
+          const emoji = status === 'paid' ? '✅' : status === 'pending' ? '🟡' : '❌';
+          const newStatusText = `Click for Status: ${emoji} ${status.charAt(0).toUpperCase()}${status.slice(1)}`;
+          // If markup already has identical Status button text, skip editing to avoid 400 not-modified
+          let prevStatusText = '';
+          try {
+            const rm: any = (callback.message as any)?.reply_markup;
+            const rows: any[] = Array.isArray(rm?.inline_keyboard) ? rm.inline_keyboard : [];
+            for (const row of rows) {
+              for (const btn of row) {
+                if (btn && typeof btn.text === 'string' && btn.text.startsWith('Status:')) {
+                  prevStatusText = btn.text;
+                  break;
+                }
+              }
+              if (prevStatusText) break;
+            }
+          } catch {}
+          const kb = { inline_keyboard: [
+            [{ text: 'Open invoice', url: `${base}/pay/${reqId}` }],
+            [{ text: 'View on Request Scan', url: `https://scan.request.network/request/${reqId}` }],
+            [{ text: newStatusText, callback_data: 'sr' }],
+          ] } as any;
+          if (status === 'paid') {
+            // Try to fetch last-known payment details to enrich caption
+            let pretty = '✅ PAID';
+            try {
+              const s2 = await fetch(`${base}/api/status?id=${encodeURIComponent(reqId)}`).then(r => r.json());
+              const amt = (s2?.balance?.paidAmount || s2?.amount || '').toString();
+              const currency = (s2?.currency || 'ETH').toString().toUpperCase();
+              const tsIso = (s2?.timestamp || new Date().toISOString()).toString();
+              const d = new Date(tsIso);
+              const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+              const dd = String(d.getUTCDate()).padStart(2, '0');
+              const yy = String(d.getUTCFullYear()).slice(-2);
+              const hh = String(d.getUTCHours()).padStart(2, '0');
+              const mi = String(d.getUTCMinutes()).padStart(2, '0');
+              const net = (s2?.network || 'mainnet').toString();
+              const netName = net.charAt(0).toUpperCase() + net.slice(1);
+              pretty = `✅ ${amt || ''} ${currency} paid on ${mm}/${dd}/${yy} @ ${hh}:${mi} UTC\nOn ${netName}\nPowered by Request Network`;
+            } catch {}
+            const mediaUrl = `${base}/Dial.letters.transparent.bg.crop.png`;
+            try {
+              await tg.editMedia(chatIdCb, messageIdCb, { type: 'photo', media: mediaUrl, caption: pretty }, kb);
+            } catch {
+              // If media unchanged or fails, still attempt markup edit when different
+              if (prevStatusText !== newStatusText) {
+                await tg.editReplyMarkup(chatIdCb, messageIdCb, kb);
+              }
+            }
+          } else if (prevStatusText !== newStatusText) {
+            await tg.editReplyMarkup(chatIdCb, messageIdCb, kb);
+          }
+          await tg.answerCallback(callback.id, newStatusText);
+        } catch (e: any) {
+          await tg.answerCallback(callback.id, e?.message || 'Error');
+        }
+        return NextResponse.json({ ok: true });
+      }
+    }
     // Inline mode support: when users type @YourBot in any chat
     const inline = body?.inline_query;
     if (inline && inline.id) {
@@ -694,19 +830,19 @@ export async function POST(req: NextRequest) {
             try { console.log('[BOT]/request -> POST', `${apiBase}/api/invoice`, { payee, amount: Number(amt), note }); } catch {}
           }
           rest = await fetch(`${apiBase}/api/invoice`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json', 'Accept': 'application/json',
-              'x-internal': process.env.INTERNAL_API_KEY || '',
-            },
-            body: JSON.stringify({
-              payee,
-              amount: Number(amt),
-              note,
-              kind: 'request',
-              initData: '',
-            }),
-          });
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json', 'Accept': 'application/json',
+            'x-internal': process.env.INTERNAL_API_KEY || '',
+          },
+          body: JSON.stringify({
+            payee,
+            amount: Number(amt),
+            note,
+            kind: 'request',
+            initData: '',
+          }),
+        });
         } catch (err: any) {
           if (DEBUG) { try { console.warn('[BOT]/request fetch /api/invoice failed:', err?.message || err); } catch {} }
           throw err;
@@ -729,6 +865,7 @@ export async function POST(req: NextRequest) {
 
         // Build QR using forwarder prediction (Create2) for improved wallet compatibility
         let ethUri: string | undefined;
+        let savedInvoiceIndexKey: string | undefined;
         try {
           const feeAddress = process.env.FEE_ADDRESS || appConfig.feeAddr || undefined;
           const feePercentage = feeAddress ? bpsToPercentString(process.env.FEE_BPS || '50') : undefined;
@@ -775,6 +912,7 @@ export async function POST(req: NextRequest) {
                 initCode: predictInput.initCode,
                 from,
               });
+              requestIdByPredictedAddress.set(String(predicted).toLowerCase(), id);
             } catch {}
             // Persist invoice metadata to S3 for later lookup by predicted address
             try {
@@ -782,6 +920,7 @@ export async function POST(req: NextRequest) {
               const lowerPred = String(predicted).toLowerCase();
               const fileName = `invoice-${lowerPred}-${tgUserName || 'anon'}-${id}.json`;
               const s3Key = `${PATH_INVOICES}${fileName}`;
+              savedInvoiceIndexKey = s3Key;
               const scanUrl = `https://scan.request.network/request/${id}`;
               const chainIdNum = Number(networkId) || 1;
               const payUri = buildEthereumUri({ to: String(predicted), valueWeiDec: decVal, chainId: chainIdNum });
@@ -852,6 +991,20 @@ export async function POST(req: NextRequest) {
               paidCaption: `✅ PAID — $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`,
               replyMarkup: keyboard,
             });
+          } catch {}
+          // Write by-request index to S3 for webhook lookup
+          try {
+            const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
+            const idxPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
+            await writeS3File(idxKey, { Body: idxPayload, ContentType: 'application/json' });
+            if (DEBUG) { try { console.log('[BOT]/request wrote index file:', idxKey); } catch {} }
+          } catch {}
+          // Write by-message index to S3 for status callback lookup
+          try {
+            const byMsgKey = `${PATH_INVOICES}by-message/${chatId}/${messageId}.json`;
+            const byMsgPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
+            await writeS3File(byMsgKey, { Body: byMsgPayload, ContentType: 'application/json' });
+            if (DEBUG) { try { console.log('[BOT]/request wrote by-message index file:', byMsgKey); } catch {} }
           } catch {}
         }
 

@@ -25,4 +25,7 @@ export const predictContextByAddress = new Map<string, PredictContext>();
 // Idempotency guard to avoid re-deploying the same salt multiple times per runtime
 export const deployedCreate2Salts = new Set<string>();
 
+// Link predicted deposit address -> requestId for later webhook lookups
+export const requestIdByPredictedAddress = new Map<string, string>();
+
 

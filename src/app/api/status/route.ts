@@ -9,16 +9,39 @@ export async function GET(req: NextRequest) {
 
   try {
     if (appConfig.request.apiKey) {
-      const apiBase = appConfig.request.restBase;
-      const resp = await fetch(`${apiBase}/request/${id}`, {
-        headers: { 'x-api-key': appConfig.request.apiKey as string, 'Accept': 'application/json' },
-      });
-      if (!resp.ok) {
-        return NextResponse.json({ status: 'error', error: `REST ${resp.status}` });
+      const apiKey = appConfig.request.apiKey as string;
+      const baseTrim = (appConfig.request.restBase || '').replace(/\/$/, '');
+      const root = baseTrim.replace(/\/v[12]$/, '');
+      // Try v2 first, then v1
+      const candidates = [
+        `${root}/v2/request/${id}`,
+        `${root}/v1/request/${id}`,
+        `${baseTrim}/request/${id}`,
+      ];
+      let data: any | undefined;
+      let lastErr: string | undefined;
+      for (const url of candidates) {
+        try {
+          const resp = await fetch(url, { headers: { 'x-api-key': apiKey, 'Accept': 'application/json' } });
+          if (resp.ok) { data = await resp.json(); break; }
+          lastErr = `REST ${resp.status}`;
+        } catch (e: any) {
+          lastErr = `REST error: ${e?.message || 'network'}`;
+        }
       }
-      const data = await resp.json();
-      const paid = !!data?.hasBeenPaid;
-      return NextResponse.json({ status: paid ? 'paid' : 'pending', balance: paid ? { balance: '1' } : { balance: '0' } });
+      if (data) {
+        const paid = !!data?.hasBeenPaid;
+        return NextResponse.json({ status: paid ? 'paid' : 'pending', balance: paid ? { balance: '1' } : { balance: '0' } });
+      }
+      // Fallback to SDK if REST paths fail
+      try {
+        const client = new RequestNetwork({ nodeConnectionConfig: { baseURL: appConfig.request.nodeUrl } });
+        const reqData = await client.fromRequestId(id);
+        const balance = await (reqData as any).getBalance();
+        const status = balance?.balance && BigInt(balance.balance) > BigInt(0) ? 'paid' : 'pending';
+        return NextResponse.json({ status, balance });
+      } catch {}
+      return NextResponse.json({ status: 'error', error: lastErr || 'REST 404' });
     }
     const client = new RequestNetwork({
       nodeConnectionConfig: {
