@@ -14,7 +14,7 @@ type Item = { href: string; label: string; emoji: string };
 const items: Item[] = [
   { href: "/", label: "Pay", emoji: "💎" },
   { href: "/history", label: "History", emoji: "📜" },
-  { href: "/tasks", label: "Tasks", emoji: "✓" },
+  { href: "/referrals", label: "Referrals", emoji: "🤝" },
   { href: "/shop", label: "Shop", emoji: "🛍️" },
   { href: "/spin", label: "Spin", emoji: "🎯" },
 ];

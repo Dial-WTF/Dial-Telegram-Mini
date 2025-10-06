@@ -282,25 +282,48 @@ export async function POST(req: NextRequest) {
     if (/^\/start\b/.test(text)) {
       const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
 
-      const message = `💎 *Dial Crypto Pay Bot*\n\nWelcome to Dial Pay - the easiest way to send and receive crypto on Telegram.\n\n*Commands:*\n• \`/invoice <amount> <asset>\` - Create invoice\n• \`/send @user <amount> <asset>\` - Send crypto\n• \`/balance\` - View wallet\n• \`/startparty\` - Create party room\n• \`/listparty\` - Browse parties\n\n*Supported:* USDT, USDC, ETH, BTC, TON, BNB, SOL`;
+      // Extract referral code from /start ref_DIAL-ABC123
+      const refMatch = text.match(/ref[_-]?(DIAL-[A-Z0-9]{6})/i);
+      const refCode = refMatch ? refMatch[1] : null;
+
+      let message = `💎 *Dial Crypto Pay Bot*\n\nWelcome to Dial Pay - the easiest way to send and receive crypto on Telegram.\n\n*Commands:*\n• \`/invoice <amount> <asset>\` - Create invoice\n• \`/send @user <amount> <asset>\` - Send crypto\n• \`/balance\` - View wallet\n• \`/startparty\` - Create party room\n• \`/listparty\` - Browse parties\n\n*Supported:* USDT, USDC, ETH, BTC, TON, BNB, SOL`;
+
+      // Add referral notice if code is present
+      if (refCode) {
+        message = `🎉 *You were referred!*\n\nReferral code: \`${refCode}\`\n\n` + message;
+      }
 
       // In private chats, use web_app for native mini app experience
       // In groups, fall back to regular URL buttons
       const isPrivate = chatType === 'private';
 
+      // Add referral code to URLs if present
+      const refParam = refCode ? `?ref=${refCode}` : '';
+      const mainUrl = `${baseUrl}${refParam}`;
+      const referralsUrl = `${baseUrl}/referrals${refParam}`;
+
       const keyboard = {
         inline_keyboard: [
           [
             isPrivate
-              ? { text: '💰 Open Dial Pay', web_app: { url: baseUrl } }
-              : { text: '💰 Open Dial Pay', url: baseUrl }
+              ? { text: '💰 Open Dial Pay', web_app: { url: mainUrl } }
+              : { text: '💰 Open Dial Pay', url: mainUrl }
           ],
           [
-            { text: '📨 Create Invoice', url: `${baseUrl}?action=invoice` },
-            { text: '⚡ Send Payment', url: `${baseUrl}?action=send` }
+            isPrivate
+              ? { text: '📨 Create Invoice', web_app: { url: `${baseUrl}?action=invoice${refCode ? `&ref=${refCode}` : ''}` } }
+              : { text: '📨 Create Invoice', url: `${baseUrl}?action=invoice${refCode ? `&ref=${refCode}` : ''}` },
+            isPrivate
+              ? { text: '⚡ Send Payment', web_app: { url: `${baseUrl}?action=send${refCode ? `&ref=${refCode}` : ''}` } }
+              : { text: '⚡ Send Payment', url: `${baseUrl}?action=send${refCode ? `&ref=${refCode}` : ''}` }
           ],
           [
-            { text: '🎉 Party Rooms', url: 'https://staging.dial.wtf' }
+            isPrivate
+              ? { text: '🤝 Referrals', web_app: { url: referralsUrl } }
+              : { text: '🤝 Referrals', url: referralsUrl },
+            isPrivate
+              ? { text: '🎉 Party Rooms', web_app: { url: 'https://staging.dial.wtf' } }
+              : { text: '🎉 Party Rooms', url: 'https://staging.dial.wtf' }
           ]
         ]
       };

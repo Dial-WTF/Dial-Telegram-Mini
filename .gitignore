@@ -43,3 +43,6 @@ next-env.d.ts
 
 # llm-example files & folders
 /llm-example
+
+# smart contracts directory (local only)
+/smartcontracts
