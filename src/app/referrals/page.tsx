@@ -4,7 +4,7 @@ import { usePrivy } from '@privy-io/react-auth';
 import { useSearchParams } from 'next/navigation';
 import { useReferral } from '@/lib/hooks/useReferral';
 import BottomNav from '@/components/BottomNav';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, Suspense } from 'react';
 
 // Match Dial theme
 const t = {
@@ -18,7 +18,7 @@ const t = {
   border: "1px solid rgba(124,58,237,.35)",
 };
 
-export default function ReferralsPage() {
+function ReferralsInner() {
   const { ready, authenticated, user, login } = usePrivy();
   const searchParams = useSearchParams();
   const refCode = searchParams.get('ref');
@@ -274,5 +274,19 @@ export default function ReferralsPage() {
         <BottomNav className="mt-3 shrink-0" />
       </div>
     </main>
+  );
+}
+
+export default function ReferralsPage() {
+  return (
+    <Suspense fallback={
+      <main className="min-h-[100dvh] flex items-center justify-center" style={{ background: t.bg, color: t.text }}>
+        <div className="text-center">
+          <div style={{ color: t.sub }}>Loading…</div>
+        </div>
+      </main>
+    }>
+      <ReferralsInner />
+    </Suspense>
   );
 }

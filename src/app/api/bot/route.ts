@@ -1,16 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { appConfig } from '@/lib/config';
+import { appConfig } from '#/lib/config';
 import { parseEther, Interface } from 'ethers';
-import { parseRequest } from '@/lib/parse';
-import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '@/lib/addr';
-import { tg } from '@/lib/telegram';
-import { fetchPayCalldata } from '@/lib/requestApi';
-import { bpsToPercentString } from '@/lib/fees';
-import { buildEthereumUri, decodeProxyDataAndValidateValue } from '@/lib/ethUri';
-import { estimateGasAndPrice } from '@/lib/gas';
-import { buildQrForRequest } from '@/lib/qrUi';
-import { isValidEthereumAddress } from '@/lib/utils';
-import { requestContextById } from '@/lib/mem';
+import { parseRequest } from '#/lib/parse';
+import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '#/lib/addr';
+import { tg } from '#/lib/telegram';
+import { fetchPayCalldata, extractForwarderInputs } from '#/lib/requestApi';
+import { bpsToPercentString } from '#/lib/fees';
+import { buildEthereumUri, decodeProxyDataAndValidateValue } from '#/lib/ethUri';
+import { buildPredictTenderlyInput, predictDestinationTenderly, createIncomingPaymentAlert } from '#/lib/tenderlyApi';
+  import { createAddressActivityWebhook, updateWebhookAddresses } from '#/lib/alchemyWebhooks';
+import ForwarderArtifact from '#/lib/contracts/DepositForwarderMinimal/DepositForwarderMinimal.json';
+import { keccak256, toHex } from 'viem';
+import { estimateGasAndPrice } from '#/lib/gas';
+import { buildQrForRequest } from '#/lib/qrUi';
+import { isValidEthereumAddress } from '#/lib/utils';
+import { requestContextById, predictContextByAddress, requestIdByPredictedAddress } from '#/lib/mem';
+import { writeFile as writeS3File } from '#/services/s3/actions/writeFile';
+import { s3 } from '#/services/s3/client';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { AWS_S3_BUCKET } from '#/config/constants';
+import { PATH_INVOICES } from '#/services/s3/filepaths';
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
 const pendingAddressByUser = new Map<number, { amount: number; note: string }>();
@@ -67,6 +76,139 @@ async function getPrivyClient() {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+    // Handle callback queries for status refresh
+    const callback = body?.callback_query;
+    if (callback && callback.id && callback.message && typeof callback.data === 'string') {
+      const chatIdCb = callback.message.chat?.id;
+      const messageIdCb = callback.message.message_id;
+      const data = callback.data as string;
+      // Data may be very short; derive reqId from original message entities/URLs
+      if (data === 'sr' && chatIdCb && messageIdCb) {
+        // Derive requestId from message content
+        let reqId = '';
+        try {
+          const entities = (callback.message as any).caption_entities || callback.message.entities || [];
+          const text: string = callback.message.caption || callback.message.text || '';
+          for (const ent of entities) {
+            const t = ent.type;
+            if (t === 'text_link' && ent.url) {
+              const m = ent.url.match(/\/pay\/([^/?#]+)/);
+              if (m) { reqId = m[1]; break; }
+            }
+          }
+          if (!reqId) {
+            const m2 = text.match(/https?:\/\/[^\s]+\/pay\/([^\s]+)/);
+            if (m2) reqId = m2[1];
+          }
+          // Fallback: scan reply_markup button URLs
+          if (!reqId) {
+            try {
+              const rm: any = (callback.message as any)?.reply_markup;
+              const rows: any[] = Array.isArray(rm?.inline_keyboard) ? rm.inline_keyboard : [];
+              for (const row of rows) {
+                for (const btn of row) {
+                  const u: string | undefined = btn?.url;
+                  if (u && typeof u === 'string') {
+                    let m = u.match(/\/pay\/([^\/?#]+)/);
+                    if (m) { reqId = m[1]; break; }
+                    m = u.match(/scan\.request\.network\/request\/([^\/?#]+)/);
+                    if (m) { reqId = m[1]; break; }
+                  }
+                }
+                if (reqId) break;
+              }
+            } catch {}
+          }
+          if (!reqId) throw new Error('request id not found');
+        } catch (err: any) {
+          // Fallback: look up requestId by chatId/messageId from S3 index
+          try {
+            const key = `${PATH_INVOICES}by-message/${chatIdCb}/${messageIdCb}.json`;
+            const obj = await s3.send(new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key }));
+            const text = await (obj.Body as any).transformToString();
+            const rec = JSON.parse(text || '{}');
+            const rid = rec?.requestId || rec?.id;
+            if (rid && typeof rid === 'string') {
+              reqId = rid;
+            } else {
+              throw new Error('request id not found');
+            }
+          } catch (e) {
+            await tg.answerCallback(callback.id, 'Unable to refresh status');
+            return NextResponse.json({ ok: false });
+          }
+        }
+        try {
+          const base = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+          const url = `${base}/api/status?id=${encodeURIComponent(reqId)}`;
+          let s: any = null;
+          try {
+            const resp = await fetch(url);
+            const txt = await resp.text();
+            try { s = JSON.parse(txt); } catch { s = { status: resp.ok ? 'pending' : 'error', error: txt.slice(0, 200) }; }
+          } catch (netErr: any) {
+            throw new Error(`status fetch failed: ${netErr?.message || 'network'}`);
+          }
+          const status = String(s?.status || 'pending');
+          const emoji = status === 'paid' ? '✅' : status === 'pending' ? '🟡' : '❌';
+          const newStatusText = `Click for Status: ${emoji} ${status.charAt(0).toUpperCase()}${status.slice(1)}`;
+          // If markup already has identical Status button text, skip editing to avoid 400 not-modified
+          let prevStatusText = '';
+          try {
+            const rm: any = (callback.message as any)?.reply_markup;
+            const rows: any[] = Array.isArray(rm?.inline_keyboard) ? rm.inline_keyboard : [];
+            for (const row of rows) {
+              for (const btn of row) {
+                if (btn && typeof btn.text === 'string' && btn.text.startsWith('Status:')) {
+                  prevStatusText = btn.text;
+                  break;
+                }
+              }
+              if (prevStatusText) break;
+            }
+          } catch {}
+          const kb = { inline_keyboard: [
+            [{ text: 'Open invoice', url: `${base}/pay/${reqId}` }],
+            [{ text: 'View on Request Scan', url: `https://scan.request.network/request/${reqId}` }],
+            [{ text: newStatusText, callback_data: 'sr' }],
+          ] } as any;
+          if (status === 'paid') {
+            // Try to fetch last-known payment details to enrich caption
+            let pretty = '✅ PAID';
+            try {
+              const s2 = await fetch(`${base}/api/status?id=${encodeURIComponent(reqId)}`).then(r => r.json());
+              const amt = (s2?.balance?.paidAmount || s2?.amount || '').toString();
+              const currency = (s2?.currency || 'ETH').toString().toUpperCase();
+              const tsIso = (s2?.timestamp || new Date().toISOString()).toString();
+              const d = new Date(tsIso);
+              const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+              const dd = String(d.getUTCDate()).padStart(2, '0');
+              const yy = String(d.getUTCFullYear()).slice(-2);
+              const hh = String(d.getUTCHours()).padStart(2, '0');
+              const mi = String(d.getUTCMinutes()).padStart(2, '0');
+              const net = (s2?.network || 'mainnet').toString();
+              const netName = net.charAt(0).toUpperCase() + net.slice(1);
+              pretty = `✅ ${amt || ''} ${currency} paid on ${mm}/${dd}/${yy} @ ${hh}:${mi} UTC\nOn ${netName}\nPowered by Request Network`;
+            } catch {}
+            const mediaUrl = `${base}/Dial.letters.transparent.bg.crop.png`;
+            try {
+              await tg.editMedia(chatIdCb, messageIdCb, { type: 'photo', media: mediaUrl, caption: pretty }, kb);
+            } catch {
+              // If media unchanged or fails, still attempt markup edit when different
+              if (prevStatusText !== newStatusText) {
+                await tg.editReplyMarkup(chatIdCb, messageIdCb, kb);
+              }
+            }
+          } else if (prevStatusText !== newStatusText) {
+            await tg.editReplyMarkup(chatIdCb, messageIdCb, kb);
+          }
+          await tg.answerCallback(callback.id, newStatusText);
+        } catch (e: any) {
+          await tg.answerCallback(callback.id, e?.message || 'Error');
+        }
+        return NextResponse.json({ ok: true });
+      }
+    }
     // Inline mode support: when users type @YourBot in any chat
     const inline = body?.inline_query;
     if (inline && inline.id) {
@@ -265,7 +407,7 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true, error: t });
         }
         const json = await rest.json();
-        const id = json.paymentReference || json.requestID || json.requestId;
+        const id = json.requestId || json.requestID || json.id;
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const openUrl = `${baseUrl}/pay/${id}`;
         const keyboard = { inline_keyboard: [[{ text: 'Open', web_app: { url: openUrl } }]] } as any;
@@ -833,7 +975,12 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true });
         }
 
-        const rest = await fetch(`${apiBase}/api/invoice`, {
+        let rest: Response;
+        try {
+          if (DEBUG) {
+            try { console.log('[BOT]/request -> POST', `${apiBase}/api/invoice`, { payee, amount: Number(amt), note }); } catch {}
+          }
+          rest = await fetch(`${apiBase}/api/invoice`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json', 'Accept': 'application/json',
@@ -847,12 +994,18 @@ export async function POST(req: NextRequest) {
             initData: '',
           }),
         });
+        } catch (err: any) {
+          if (DEBUG) { try { console.warn('[BOT]/request fetch /api/invoice failed:', err?.message || err); } catch {} }
+          throw err;
+        }
         if (!rest.ok) {
-          const t = await rest.text();
+          const t = await rest.text().catch(() => '');
+          if (DEBUG) { try { console.warn('[BOT]/request invoice non-OK:', rest.status, rest.statusText, t.slice(0, 300)); } catch {} }
           await reply(`Failed to create invoice: ${rest.status} ${rest.statusText}`);
           return NextResponse.json({ ok: true, error: t });
         }
-        const json = await rest.json();
+        const json = await rest.json().catch(() => ({} as any));
+        if (DEBUG) { try { console.log('[BOT]/request invoice OK response keys:', Object.keys(json || {})); } catch {} }
         const id = json.requestId || json.requestID || json.id;
         if (!id) {
           await reply('Invoice created but id missing');
@@ -861,37 +1014,123 @@ export async function POST(req: NextRequest) {
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const invUrl = `${baseUrl}/pay/${id}`;
 
-        // Build QR using utils and pay endpoint; fallback to invoice link on any mismatch
+        // Build QR using forwarder prediction (Create2) for improved wallet compatibility
         let ethUri: string | undefined;
+        let savedInvoiceIndexKey: string | undefined;
         try {
           const feeAddress = process.env.FEE_ADDRESS || appConfig.feeAddr || undefined;
           const feePercentage = feeAddress ? bpsToPercentString(process.env.FEE_BPS || '50') : undefined;
+          if (DEBUG) { try { console.log('[BOT]/request fetching pay calldata for id=', id); } catch {} }
           const payJson = await fetchPayCalldata(id, { feeAddress, feePercentage, apiKey: appConfig.request.apiKey || process.env.REQUEST_API_KEY });
-          const txs: any[] = Array.isArray((payJson as any)?.transactions) ? (payJson as any).transactions : [];
-          const idx: number = Number.isInteger((payJson as any)?.metadata?.paymentTransactionIndex)
-            ? (payJson as any).metadata.paymentTransactionIndex
-            : 0;
-          const sel = txs[idx] || txs[0];
-          if (sel && typeof sel.to === 'string') {
-            const toAddr: string = sel.to;
-            const data: string | undefined = typeof sel.data === 'string' ? sel.data : undefined;
-            const hexVal: string | undefined = typeof sel.value?.hex === 'string' ? sel.value.hex : undefined;
-            const decVal = (() => { try { return hexVal ? BigInt(hexVal).toString(10) : '0'; } catch { return '0'; } })();
-            let gasDec: string | undefined;
-            let gasPriceDec: string | undefined;
-            if (process.env.QR_INCLUDE_GAS_HINTS === '1') {
-              const est = await estimateGasAndPrice({ rpcUrl: process.env.RPC_URL, to: toAddr, data, valueWeiDec: decVal });
-              gasDec = est.gas; gasPriceDec = est.gasPrice;
+          if (DEBUG) { try { console.log('[BOT]/request pay transactions:', Array.isArray((payJson as any)?.transactions) ? (payJson as any).transactions.length : 0); } catch {} }
+          const fwd = extractForwarderInputs(payJson);
+          if (DEBUG) { try { console.log('[BOT]/request forwarder inputs:', { proxy: fwd.requestProxy, to: fwd.beneficiary, feeAddress: fwd.feeAddress, feeAmountWei: String(fwd.feeAmountWei), hasAmount: typeof fwd.amountWei === 'bigint' }); } catch {} }
+
+          // Compute network id and CreateX config
+          const chainKey = String(appConfig.request.chain || '').toLowerCase();
+          const NETWORK_ID_BY_CHAIN: Record<string, string> = { base: '8453', ethereum: '1', mainnet: '1', sepolia: '11155111' };
+          const networkId = process.env.TENDERLY_NETWORK_ID || NETWORK_ID_BY_CHAIN[chainKey] || '1';
+          const createx = (process.env.CREATEX_ADDRESS || process.env.CREATE_X || '').trim() as `0x${string}`;
+          const from = (process.env.TENDERLY_FROM || process.env.CREATEX_FROM || '').trim() as `0x${string}`;
+          if (!/^0x[0-9a-fA-F]{40}$/.test(createx)) throw new Error('Missing CREATEX_ADDRESS');
+          if (!/^0x[0-9a-fA-F]{40}$/.test(from)) throw new Error('Missing TENDERLY_FROM');
+
+          // Salt ties deposit address to request id and chain
+          const salt = keccak256(toHex(`DIAL|${id}|${networkId}`)) as `0x${string}`;
+          const predictInput = buildPredictTenderlyInput({
+            networkId,
+            createx,
+            from,
+            requestProxy: fwd.requestProxy,
+            beneficiary: fwd.beneficiary,
+            paymentReferenceHex: fwd.paymentReferenceHex,
+            feeAmountWei: fwd.feeAmountWei,
+            feeAddress: fwd.feeAddress,
+            salt,
+            artifact: { bytecode: (ForwarderArtifact as any)?.bytecode as `0x${string}` },
+          });
+          if (DEBUG) { try { console.log('[BOT]/request predict input:', { networkId, createx, from, salt: predictInput.salt.slice(0,10)+'…', initCodeLen: predictInput.initCode.length }); } catch {} }
+          const { predicted } = await predictDestinationTenderly(predictInput);
+          if (DEBUG) { try { console.log('[BOT]/request predicted address:', predicted); } catch {} }
+          if (predicted && fwd.amountWei && fwd.amountWei > 0n) {
+            const decVal = fwd.amountWei.toString(10);
+            // Save predict context for webhook
+            try {
+              predictContextByAddress.set(String(predicted).toLowerCase(), {
+                networkId,
+                createx,
+                salt: predictInput.salt,
+                initCode: predictInput.initCode,
+                from,
+              });
+              requestIdByPredictedAddress.set(String(predicted).toLowerCase(), id);
+            } catch {}
+            // Persist invoice metadata to S3 for later lookup by predicted address
+            try {
+              const tgUserName: string = (msg?.from?.username || '').toString();
+              const lowerPred = String(predicted).toLowerCase();
+              const fileName = `invoice-${lowerPred}-${tgUserName || 'anon'}-${id}.json`;
+              const s3Key = `${PATH_INVOICES}${fileName}`;
+              savedInvoiceIndexKey = s3Key;
+              const scanUrl = `https://scan.request.network/request/${id}`;
+              const chainIdNum = Number(networkId) || 1;
+              const payUri = buildEthereumUri({ to: String(predicted), valueWeiDec: decVal, chainId: chainIdNum });
+              const record = {
+                requestId: id,
+                networkId,
+                predictedAddress: String(predicted),
+                salt: predictInput.salt,
+                initCode: predictInput.initCode,
+                requestProxy: fwd.requestProxy,
+                beneficiary: fwd.beneficiary,
+                paymentReferenceHex: fwd.paymentReferenceHex,
+                feeAmountWei: fwd.feeAmountWei.toString(),
+                feeAddress: fwd.feeAddress,
+                amountWei: decVal,
+                ethereumUri: payUri,
+                requestScanUrl: scanUrl,
+                telegram: {
+                  chatId,
+                  chatType,
+                  userId: tgUserId,
+                  username: tgUserName || undefined,
+                  commandText: text,
+                },
+                createdAt: new Date().toISOString(),
+              } as const;
+              const body = Buffer.from(JSON.stringify(record, null, 2));
+              await writeS3File(s3Key, { Body: body, ContentType: 'application/json' });
+              if (DEBUG) { try { console.log('[BOT]/request saved invoice json to S3:', s3Key); } catch {} }
+            } catch (e) {
+              if (DEBUG) { try { console.warn('[BOT]/request failed to save invoice S3:', (e as any)?.message || e); } catch {} }
             }
-            ethUri = buildEthereumUri({ to: toAddr, valueWeiDec: decVal, data, chainId: 1, gas: gasDec, gasPrice: gasPriceDec });
-            const check = decodeProxyDataAndValidateValue(data, decVal, amt);
-            if (!check.ok) {
-              if (DEBUG) { try { console.warn('[BOT] Value/fee mismatch; fallback', check); } catch {} }
-              ethUri = undefined;
+            // Register address activity on Alchemy webhook (create once, then update addresses)
+            try {
+              const alchemyWebhookId = process.env.ALCHEMY_WEBHOOK_ID;
+              if (alchemyWebhookId) {
+                await updateWebhookAddresses({ webhookId: alchemyWebhookId, add: [predicted as `0x${string}`], remove: [] });
+                if (DEBUG) {
+                  try { console.log('[BOT]/request alchemy: added address to webhook', { webhookId: alchemyWebhookId, address: predicted }); } catch {}
+                }
+              } else {
+                const created = await createAddressActivityWebhook({ addresses: [predicted as `0x${string}`] });
+                if (DEBUG) {
+                  try { console.log('[BOT]/request alchemy: created webhook', created); } catch {}
+                }
+              }
+            } catch (e) {
+              if (DEBUG) { try { console.warn('[BOT] alchemy webhook setup failed', { error: (e as any)?.message || e }); } catch {} }
             }
-            if (DEBUG && ethUri) { try { console.log('[BOT] built ethUri from pay endpoint:', ethUri); } catch {} }
+            // Action registration temporarily disabled; focusing on alert only
+
+            // Build direct ETH URI to pay predicted deposit address
+            const chainIdNum = Number(networkId) || 1;
+            ethUri = buildEthereumUri({ to: predicted, valueWeiDec: decVal, chainId: chainIdNum });
+            if (DEBUG && ethUri) { try { console.log('[BOT] built ethUri (predict):', ethUri); } catch {} }
           }
-        } catch {}
+        } catch (e) {
+          if (DEBUG) { try { console.warn('[BOT] forwarder predict failed; fallback to invoice link', (e as any)?.message || e); } catch {} }
+        }
         const { qrUrl, caption, keyboard, payUrl: builtPayUrl } = buildQrForRequest(baseUrl, id, ethUri, amt, note || '');
         const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
         const messageId = sent?.result?.message_id as number | undefined;
@@ -903,6 +1142,20 @@ export async function POST(req: NextRequest) {
               paidCaption: `✅ PAID — $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`,
               replyMarkup: keyboard,
             });
+          } catch {}
+          // Write by-request index to S3 for webhook lookup
+          try {
+            const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
+            const idxPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
+            await writeS3File(idxKey, { Body: idxPayload, ContentType: 'application/json' });
+            if (DEBUG) { try { console.log('[BOT]/request wrote index file:', idxKey); } catch {} }
+          } catch {}
+          // Write by-message index to S3 for status callback lookup
+          try {
+            const byMsgKey = `${PATH_INVOICES}by-message/${chatId}/${messageId}.json`;
+            const byMsgPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
+            await writeS3File(byMsgKey, { Body: byMsgPayload, ContentType: 'application/json' });
+            if (DEBUG) { try { console.log('[BOT]/request wrote by-message index file:', byMsgKey); } catch {} }
           } catch {}
         }
 

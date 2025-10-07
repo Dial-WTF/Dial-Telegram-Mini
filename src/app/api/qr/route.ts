@@ -220,8 +220,9 @@ export async function GET(req: NextRequest) {
         .png()
         .toBuffer();
     }
-
-    return new NextResponse(out, {
+    // Return as a Buffer which is compatible with NextResponse init
+    const bytes = Buffer.from(out);
+    return new NextResponse(bytes, {
       headers: noCache
         ? {
             "Content-Type": "image/png",

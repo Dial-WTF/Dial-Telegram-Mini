@@ -10,9 +10,12 @@
     "test:bot:dm": "curl -s -X POST $PUBLIC_BASE_URL/api/bot -H 'Content-Type: application/json' -d @tests/bot/dm-request.json | cat",
     "test:bot:group": "curl -s -X POST $PUBLIC_BASE_URL/api/bot -H 'Content-Type: application/json' -d @tests/bot/group-request.json | cat",
     "mate:info": "pnpm dlx @telegram-apps/mate@latest deploy info --project dial-telegram-mini | cat",
-    "mate:upload": "pnpm dlx @telegram-apps/mate@latest deploy upload --project dial-telegram-mini --dir ./public | cat"
+    "mate:upload": "pnpm dlx @telegram-apps/mate@latest deploy upload --project dial-telegram-mini --dir ./public | cat",
+    "create-alchemy-webhook": "./scripts/create-alchemy-webhook.sh"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.901.0",
+    "@aws-sdk/s3-request-presigner": "^3.901.0",
     "@privy-io/node": "^0.2.0",
     "@privy-io/react-auth": "^3.0.1",
     "@requestnetwork/request-client.js": "^0.59.0",
@@ -20,10 +23,13 @@
     "@telegram-apps/sdk": "^3.11.5",
     "@twa-dev/sdk": "^8.0.2",
     "ethers": "^6.15.0",
+    "lodash": "^4.17.21",
+    "lodash.throttle": "^4.1.1",
     "next": "15.5.4",
     "qrcode": "^1.5.4",
     "react": "19.1.0",
     "react-dom": "19.1.0",
+    "s3": "link:aws-sdk/clients/s3",
     "sharp": "^0.34.4",
     "viem": "^2.37.9"
   },
@@ -31,7 +37,10 @@
     "@eslint/eslintrc": "^3",
     "@tailwindcss/postcss": "^4",
     "@telegram-apps/mate": "^0.0.27",
+    "@types/lodash": "^4.17.20",
+    "@types/lodash.throttle": "^4.1.9",
     "@types/node": "^20",
+    "@types/qrcode": "^1.5.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",

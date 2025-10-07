@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { CreateCheckRequest, CryptoCheck } from '@/types/crypto';
+import { CreateCheckRequest, CryptoCheck } from '#/types/crypto';
 import {
   generateCheckId,
   isValidAsset,
   getAssetEmoji,
-} from '@/lib/crypto-utils';
+} from '#/lib/crypto-utils';
 
 // In-memory storage
 const checks = new Map<string, CryptoCheck>();

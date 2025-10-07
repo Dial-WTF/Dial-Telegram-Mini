@@ -1,4 +1,4 @@
-import { formatCaption } from '@/lib/format';
+import { formatCaption } from '#/lib/format';
 
 export function buildQrForRequest(baseUrl: string, id: string, ethUri: string | undefined, amt: number, note: string) {
   const base = (baseUrl || '').replace(/\/$/, '');
@@ -11,7 +11,7 @@ export function buildQrForRequest(baseUrl: string, id: string, ethUri: string | 
   const topRow: any[] = [{ text: 'Open invoice', url: payUrl }];
   if (ethUri) topRow.push({ text: 'Pay in wallet', url: `${base}/paylink?uri=${encodeURIComponent(ethUri)}` });
   const scanRow: any[] = [{ text: 'View on Request Scan', url: scanUrl }];
-  const statusRow: any[] = [{ text: 'Status: Pending', callback_data: 'status_pending', sticker: 'ABCEmoji' }];
+  const statusRow: any[] = [{ text: 'Status: ❌ Unpaid', callback_data: 'sr' }];
   const keyboard = { inline_keyboard: [topRow, scanRow, statusRow] } as any;
   return { qrUrl, caption, keyboard, payUrl };
 }
