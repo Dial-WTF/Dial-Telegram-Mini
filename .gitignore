@@ -46,3 +46,7 @@ next-env.d.ts
 
 # smart contracts directory (local only)
 /smartcontracts
+
+# AI model storage (local only)
+/models
+/torrents

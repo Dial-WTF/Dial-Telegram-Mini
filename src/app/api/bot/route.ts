@@ -350,6 +350,112 @@ export async function POST(req: NextRequest) {
           text: `Creating ${amount} ${asset} invoice...\n\nUse: \`/invoice ${amount} ${asset}\` to create it now!`,
           parse_mode: 'Markdown'
         });
+      } else if (callbackData && callbackData.startsWith('ai_chat_')) {
+        // Handle AI model selection for chat
+        const modelId = callbackData.replace('ai_chat_', '');
+        
+        // Start chat session
+        const { getChatSession } = await import('@/lib/ai-chat-session');
+        getChatSession(callbackUserId, callbackChatId, modelId);
+        
+        await tgCall('sendMessage', {
+          chat_id: callbackChatId,
+          text: `🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend me a message to chat with the AI.\n\nUse \`/ai-clear\` to end the session.`,
+          parse_mode: 'Markdown'
+        });
+      } else if (callbackData && callbackData.startsWith('ai_serve_')) {
+        // Handle Serve & Chat: start model server then open chat session
+        const modelId = callbackData.replace('ai_serve_', '');
+        try {
+          const apiBase = req.nextUrl.origin;
+          const res = await fetch(`${apiBase}/api/ai/serve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ modelId }),
+          });
+          if (!res.ok) {
+            const errText = await res.text();
+            await tgCall('sendMessage', {
+              chat_id: callbackChatId,
+              text: `❌ Failed to start model: ${errText}`,
+            });
+          } else {
+            // Start chat session immediately
+            const { getChatSession } = await import('@/lib/ai-chat-session');
+            getChatSession(callbackUserId, callbackChatId, modelId);
+            await tgCall('sendMessage', {
+              chat_id: callbackChatId,
+              text: `✅ Model started.\n\n🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend me a message to chat with the AI.\n\nUse \`/ai-clear\` to end the session.`,
+              parse_mode: 'Markdown'
+            });
+          }
+        } catch (err: any) {
+          await tgCall('sendMessage', { chat_id: callbackChatId, text: `Error: ${err?.message || 'unknown'}` });
+        }
+      } else if (callbackData === 'ai_setup_done') {
+        // Next steps after installer
+        const textMsg = '✅ *Installer Complete*\n\nNext steps:\n1) Download a sample model (DeepSeek R1 Qwen 1.5B)\n2) Watch progress with /ai-list\n3) Chat with the model via /ai (Serve & Chat)\n\nTap a button below to continue.';
+        const userBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const keyboard = {
+          inline_keyboard: [
+            [{ text: '⬇️ Download DeepSeek (recommended)', callback_data: 'ai_dl_deepseek_r1_qwen15b' }],
+            [{ text: '⬇️ Download Qwen2.5 1.5B (GGUF)', callback_data: 'ai_dl_qwen25_1_5b_gguf' }],
+            [{ text: '📚 Show Models', callback_data: 'ai_show_models' }],
+            [{ text: '💬 Chat Selector', callback_data: 'ai_show_chat_selector' }],
+            [{ text: '🧩 macOS: Copy Command Page', url: `${userBase}/ai/setup/mac` }],
+            [{ text: '⬇️ Linux Installer (.sh)', url: `${userBase}/api/ai/setup/download/linux` }],
+            [{ text: '⬇️ Linux GPU Installer (.sh)', url: `${userBase}/api/ai/setup/download/linux-gpu` }],
+          ],
+        } as any;
+        await tgCall('sendMessage', { chat_id: callbackChatId, text: textMsg, parse_mode: 'Markdown', reply_markup: keyboard });
+      } else if (callbackData === 'ai_dl_deepseek_r1_qwen15b') {
+        // Trigger sample model download
+        try {
+          const url = 'https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B';
+          const msg = '🚀 Starting download: DeepSeek R1 Qwen 1.5B\n\n• This may take time depending on size and peers.\n• Use /ai-list to see progress.\n• When ready, use /ai to Serve & Chat.';
+          const kb = { inline_keyboard: [[{ text: '📚 Show Models', callback_data: 'ai_show_models' }]] } as any;
+          await tgCall('sendMessage', { chat_id: callbackChatId, text: msg, parse_mode: 'Markdown', reply_markup: kb });
+
+          // Kick off background download without internal HTTP hop
+          (async () => {
+            try {
+              const { addModelFromHuggingFace } = await import('@/lib/ai-model-manager');
+              await addModelFromHuggingFace({ huggingFaceUrl: url, createTorrent: true });
+            } catch (e) {
+              try { console.error('[Bot] Background download error:', e); } catch {}
+            }
+          })();
+        } catch (err: any) {
+          await tgCall('sendMessage', { chat_id: callbackChatId, text: `Error: ${err?.message || 'unknown'}` });
+        }
+      } else if (callbackData === 'ai_dl_qwen25_1_5b_gguf') {
+        // Trigger Qwen2.5 1.5B Instruct GGUF sample download
+        try {
+          const url = 'https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF';
+          const msg = '🚀 Starting download: Qwen2.5 1.5B Instruct (GGUF)\n\n• This may take time depending on size and peers.\n• Use /ai-list to see progress.\n• When ready, use /ai to Serve & Chat.';
+          const kb = { inline_keyboard: [[{ text: '📚 Show Models', callback_data: 'ai_show_models' }]] } as any;
+          await tgCall('sendMessage', { chat_id: callbackChatId, text: msg, parse_mode: 'Markdown', reply_markup: kb });
+
+          (async () => {
+            try {
+              const { addModelFromHuggingFace } = await import('@/lib/ai-model-manager');
+              await addModelFromHuggingFace({ huggingFaceUrl: url, createTorrent: true });
+            } catch (e) {
+              try { console.error('[Bot] Background download error (Qwen2.5 GGUF):', e); } catch {}
+            }
+          })();
+        } catch (err: any) {
+          await tgCall('sendMessage', { chat_id: callbackChatId, text: `Error: ${err?.message || 'unknown'}` });
+        }
+      } else if (callbackData === 'ai_show_models') {
+        const { handleAiListCommand } = await import('@/lib/bot/ai-commands');
+        const message = handleAiListCommand();
+        const kb = { inline_keyboard: [[{ text: '💬 Chat Selector', callback_data: 'ai_show_chat_selector' }]] } as any;
+        await tgCall('sendMessage', { chat_id: callbackChatId, text: message, parse_mode: 'Markdown', reply_markup: kb });
+      } else if (callbackData === 'ai_show_chat_selector') {
+        const { handleAiChatCommand } = await import('@/lib/bot/ai-commands');
+        const { message, keyboard } = handleAiChatCommand();
+        await tgCall('sendMessage', { chat_id: callbackChatId, text: message, parse_mode: 'Markdown', reply_markup: keyboard });
       }
 
       return NextResponse.json({ ok: true });
@@ -372,6 +478,51 @@ export async function POST(req: NextRequest) {
     // Avoid spamming group chats: only act on slash commands. In DMs, allow normal flow.
     const isCommand = typeof text === 'string' && text.startsWith('/');
     if (!isCommand && chatType !== 'private') {
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ask <message> - Ask AI in any chat (group-friendly)
+    if (/^\/ask\b/i.test(text)) {
+      const question = text.replace(/^\/ask\b/i, '').trim();
+      if (!question) {
+        await tgCall('sendMessage', { chat_id: chatId, text: 'Usage: /ask <message>\n\nExample: /ask explain JSON in one sentence' });
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        const { getActiveSession, getSessionMessages, addMessageToSession, getChatSession } = await import('@/lib/ai-chat-session');
+        const { getServingModels } = await import('@/lib/ai-model-storage');
+
+        // Pick model: active session for this user+chat, else single serving model
+        let modelId = getActiveSession(tgUserId, chatId)?.modelId;
+        if (!modelId) {
+          const serving = getServingModels();
+          if (serving.length === 1) modelId = serving[0].id;
+        }
+
+        if (!modelId) {
+          // No active or unambiguous serving model — show selector
+          const { handleAiChatCommand } = await import('@/lib/bot/ai-commands');
+          const { message, keyboard } = handleAiChatCommand();
+          await tgCall('sendMessage', { chat_id: chatId, text: message + '\n\nTip: Use /ai-serve <model_id> first, then retry /ask.', parse_mode: 'Markdown', reply_markup: keyboard });
+          return NextResponse.json({ ok: true });
+        }
+
+        // Ensure session exists on this user+chat+model
+        getChatSession(tgUserId, chatId, modelId);
+        addMessageToSession(tgUserId, chatId, { role: 'user', content: question });
+        const messages = getSessionMessages(tgUserId, chatId);
+
+        // Call AI directly (no internal HTTP hop)
+        const { chat } = await import('@/lib/ai-inference');
+        const data = await chat({ modelId, messages, maxTokens: 512, temperature: 0.7, stream: false });
+        const aiResponse = data.content || 'No response';
+        addMessageToSession(tgUserId, chatId, { role: 'assistant', content: aiResponse });
+        await tgCall('sendMessage', { chat_id: chatId, text: aiResponse });
+      } catch (err: any) {
+        await tgCall('sendMessage', { chat_id: chatId, text: `Error: ${err?.message || 'unknown'}` });
+      }
+
       return NextResponse.json({ ok: true });
     }
 
@@ -921,6 +1072,271 @@ export async function POST(req: NextRequest) {
       } catch (err: any) {
         await reply(`Error: ${err?.message || 'unknown'}`);
         return NextResponse.json({ ok: false });
+      }
+    }
+
+    // AI COMMANDS - Decentralized AI Model Serving
+
+    // /ai <url> - Download model from HuggingFace
+    if (/^\/ai\s+https?:\/\//i.test(text)) {
+      const { handleAiDownloadCommand } = await import('@/lib/bot/ai-commands');
+      const url = text.split(/\s+/).slice(1).join(' ');
+      const message = await handleAiDownloadCommand(url);
+      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+
+      // Trigger background download directly (no internal HTTP)
+      try {
+        (async () => {
+          try {
+            const { addModelFromHuggingFace } = await import('@/lib/ai-model-manager');
+            await addModelFromHuggingFace({ huggingFaceUrl: url, createTorrent: true });
+          } catch (e) {
+            try { console.error('[Bot] AI download error:', e); } catch {}
+          }
+        })();
+      } catch (err) {
+        console.error('[Bot] Failed to trigger download:', err);
+      }
+
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai-list - List downloaded models
+    if (/^\/ai-list\b/i.test(text)) {
+      const { handleAiListCommand } = await import('@/lib/bot/ai-commands');
+      const message = handleAiListCommand();
+      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai-serve <model_id> - Start serving a model
+    if (/^\/ai-serve\b/i.test(text)) {
+      const { handleAiServeCommand, getServeSelectionKeyboard } = await import('@/lib/bot/ai-commands');
+      const parts = text.split(/\s+/);
+      const modelId = parts[1];
+      const message = handleAiServeCommand(modelId);
+
+      if (!modelId) {
+        const keyboard = getServeSelectionKeyboard();
+        await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown', reply_markup: keyboard });
+        return NextResponse.json({ ok: true });
+      }
+
+      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+
+      // Start serving directly and open chat session
+      try {
+        const { startModelServer } = await import('@/lib/ai-inference');
+        await startModelServer({ modelId });
+        const { getChatSession } = await import('@/lib/ai-chat-session');
+        getChatSession(tgUserId, chatId, modelId);
+        await tgCall('sendMessage', {
+          chat_id: chatId,
+          text: `🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend me a message to chat with the AI.\n\nUse \`/ai-clear\` to end the session.`,
+          parse_mode: 'Markdown',
+        });
+      } catch (err: any) {
+        console.error('[Bot] Failed to start serving/chat:', err);
+        await tgCall('sendMessage', {
+          chat_id: chatId,
+          text: `❌ *Failed to start model server*\n\n${err?.message || 'unknown error'}\n\nCheck:\n• Model file exists and is GGUF\n• LLAMA_SERVER_BIN is set in .env\n• Binary is executable`,
+          parse_mode: 'Markdown',
+        });
+      }
+
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai-chat <model_id> - Manually start a chat session with a serving model
+    if (/^\/ai-chat\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const modelId = parts[1];
+      if (!modelId) {
+        await reply('Usage: /ai-chat <model_id>\n\nUse /ai-list to see available models.');
+        return NextResponse.json({ ok: true });
+      }
+      try {
+        const { getModelById, getServeStatus } = await import('@/lib/ai-model-storage');
+        const model = getModelById(modelId);
+        if (!model) {
+          await reply('❌ Model not found. Use /ai-list to see models.');
+          return NextResponse.json({ ok: true });
+        }
+        const status = getServeStatus(modelId);
+        if (!status?.isServing) {
+          await reply('❌ Model is not serving. Start it with /ai-serve <model_id> or use /ai.');
+          return NextResponse.json({ ok: true });
+        }
+        const { getChatSession } = await import('@/lib/ai-chat-session');
+        getChatSession(tgUserId, chatId, modelId);
+        await reply(`🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend a message to chat.\nUse \`/ai-clear\` to end the session.`);
+      } catch (err: any) {
+        await reply(`Error: ${err?.message || 'unknown'}`);
+      }
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai-stop <model_id> - Stop serving a model
+    if (/^\/ai-stop\b/i.test(text)) {
+      const parts = text.split(/\s+/);
+      const modelId = parts[1];
+
+      if (!modelId) {
+        await reply('Usage: /ai-stop <model_id>\n\nUse /ai-list to see serving models.');
+        return NextResponse.json({ ok: true });
+      }
+
+      try {
+        const apiBase = req.nextUrl.origin;
+        const res = await fetch(`${apiBase}/api/ai/serve?modelId=${modelId}`, {
+          method: 'DELETE',
+        });
+
+        if (res.ok) {
+          await reply(`✅ Stopped serving model: \`${modelId}\``);
+        } else {
+          await reply(`❌ Failed to stop model: ${await res.text()}`);
+        }
+      } catch (err: any) {
+        await reply(`Error: ${err?.message || 'unknown'}`);
+      }
+
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai-help - AI commands help
+    if (/^\/ai-help\b/i.test(text)) {
+      const { getAiHelpMessage } = await import('@/lib/bot/ai-commands');
+      const message = getAiHelpMessage();
+      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai-setup - Provide one-click OS-specific installers
+    if (/^\/ai-setup\b$/i.test(text)) {
+      const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+      const macPkgUrl = process.env.MAC_INSTALLER_URL; // Signed & notarized PKG
+      const message = (
+        `🛠️ *One-Click Installer*\n\n` +
+        `Tap your OS to download the installer. Then double-click it to run.\n\n` +
+        `This will:\n` +
+        `• Install Node deps\n` +
+        `• Build llama-server locally\n` +
+        `• Configure .env for AI\n` +
+        (macPkgUrl ? `\n✅ macOS link is signed & notarized to avoid Gatekeeper warnings.` : `\n⚠️ macOS .command may need right-click → Open on first run.`)
+      );
+      const rows: any[] = [];
+      // Quick confirm button
+      rows.push([{ text: '✅ I ran the installer', callback_data: 'ai_setup_done' }]);
+      // macOS copy page (simplest path for users to copy command)
+      rows.push([{ text: '🧩 macOS: Copy Command Page', url: `${baseUrl}/ai/setup/mac` }]);
+      if (macPkgUrl) {
+        rows.push([{ text: '⬇️ macOS Installer (Signed PKG)', url: macPkgUrl }]);
+      } else {
+        rows.push([{ text: '⬇️ macOS Installer (.command)', url: `${baseUrl}/api/ai/setup/download/mac` }]);
+      }
+      rows.push([{ text: '⬇️ Linux Installer (.sh)', url: `${baseUrl}/api/ai/setup/download/linux` }]);
+      rows.push([{ text: '⬇️ Linux GPU Installer (.sh)', url: `${baseUrl}/api/ai/setup/download/linux-gpu` }]);
+
+      const keyboard = { inline_keyboard: rows } as any;
+      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown', reply_markup: keyboard });
+
+      // Also include the raw curl command for quick copy inside Telegram
+      const curlCmd = `curl -fsSL ${baseUrl}/api/ai/setup/script | bash -s -- --auto`;
+      const copyMsg = `macOS quick command:\n\n\`\`\`bash\n${curlCmd}\n\`\`\`\n\nAfter you run it, tap "I ran the installer" above.`;
+      await tgCall('sendMessage', { chat_id: chatId, text: copyMsg, parse_mode: 'Markdown' });
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai-setup-gpu - Highlight Linux GPU installer
+    if (/^\/ai-setup-gpu\b$/i.test(text)) {
+      const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+      const message = (
+        `🛠️ *One-Click GPU Installer (Linux CUDA)*\n\n` +
+        `Tap to download, then double-click to run. If CUDA build fails, it falls back to CPU.\n`
+      );
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: '⬇️ Linux GPU Installer (.sh)', url: `${baseUrl}/api/ai/setup/download/linux-gpu` }],
+        ],
+      } as any;
+      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown', reply_markup: keyboard });
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai - Chat with AI (show model selection or continue conversation)
+    if (/^\/ai(?:@\S+)?\s*$/i.test(text)) {
+      const { handleAiChatCommand } = await import('@/lib/bot/ai-commands');
+      const { message, keyboard } = handleAiChatCommand();
+      await tgCall('sendMessage', {
+        chat_id: chatId,
+        text: message,
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+      });
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ai-clear - Clear chat session
+    if (/^\/ai-clear\b/i.test(text)) {
+      const { clearSession } = await import('@/lib/ai-chat-session');
+      clearSession(tgUserId, chatId);
+      await reply('🗑️ Chat session cleared. Use /ai to start a new conversation.');
+      return NextResponse.json({ ok: true });
+    }
+
+    // Handle AI chat in private messages (if session is active)
+    if (chatType === 'private' && !isCommand) {
+      const { getActiveSession, addMessageToSession, getSessionMessages } = await import('@/lib/ai-chat-session');
+      const session = getActiveSession(tgUserId, chatId);
+
+      if (session) {
+        // User is in an active AI chat session
+        try {
+          // Add user message to session
+          addMessageToSession(tgUserId, chatId, {
+            role: 'user',
+            content: text,
+          });
+
+          // Get full conversation history
+          const messages = getSessionMessages(tgUserId, chatId);
+
+          // Send to AI
+          const apiBase = req.nextUrl.origin;
+          const res = await fetch(`${apiBase}/api/ai/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              modelId: session.modelId,
+              messages,
+              maxTokens: 512,
+              temperature: 0.7,
+            }),
+          });
+
+          if (!res.ok) {
+            await reply(`❌ AI error: ${await res.text()}\n\nUse /ai-clear to start over.`);
+            return NextResponse.json({ ok: true });
+          }
+
+          const data = await res.json();
+          const aiResponse = data.result?.content || 'No response';
+
+          // Add AI response to session
+          addMessageToSession(tgUserId, chatId, {
+            role: 'assistant',
+            content: aiResponse,
+          });
+
+          // Send response
+          await reply(aiResponse);
+          return NextResponse.json({ ok: true });
+        } catch (err: any) {
+          console.error('[Bot] AI chat error:', err);
+          await reply(`Error: ${err?.message || 'unknown'}\n\nUse /ai-clear to reset.`);
+          return NextResponse.json({ ok: true });
+        }
       }
     }
 

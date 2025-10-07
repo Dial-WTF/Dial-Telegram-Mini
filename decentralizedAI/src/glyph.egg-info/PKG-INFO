@@ -1,0 +1,77 @@
+Metadata-Version: 2.4
+Name: glyph
+Version: 0.1.0
+Summary: Glyph: decentralized AI serving/training network with Bitcoin Runes rewards
+Author: Glyph Team
+License: Apache-2.0
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.111
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: pydantic>=2.7
+Requires-Dist: websockets>=12.0
+Requires-Dist: httpx>=0.27
+Requires-Dist: requests>=2.31
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: cryptography>=42.0
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: aiosqlite>=0.20
+Requires-Dist: transformers>=4.44
+Requires-Dist: accelerate>=0.32
+Requires-Dist: torch>=2.2; platform_system != "Darwin" or platform_machine != "arm64"
+Provides-Extra: dev
+Requires-Dist: black>=24.4; extra == "dev"
+Requires-Dist: ruff>=0.4; extra == "dev"
+
+Glyph
+=====
+
+Glyph is a fresh, ground-up decentralized AI network that rewards participants in a Bitcoin Runes token for serving, training, and fine-tuning open models.
+
+Components
+----------
+
+- glyph-gateway: Public API and scheduler. Tracks nodes, emits signed receipts, aggregates rewards
+- glyph-node: Runs a model server on a single GPU and signs per-request receipts
+- glyph-client: Simple CLI client for chat/generation
+
+Quickstart
+----------
+
+1) Install
+
+```
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+2) Download DeepSeek-R1-Distill-Qwen-1.5B
+
+```
+pip install huggingface_hub
+python - << 'PY'
+from huggingface_hub import snapshot_download
+snapshot_download('deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B', local_dir='DeepSeek-R1-Distill-Qwen-1.5B', local_dir_use_symlinks=False)
+PY
+```
+
+3) Start the gateway
+
+```
+python -m glyph gateway --host 0.0.0.0 --port 8080 --rune-ticker GLYPH
+```
+
+4) Start a node (loads model from local dir)
+
+```
+python -m glyph node --model ./DeepSeek-R1-Distill-Qwen-1.5B
+```
+
+5) Generate from client
+
+```
+python -m glyph client --gateway http://127.0.0.1:8080 --prompt "Explain quantum entanglement in simple terms."
+```
+
+

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glyph"
+version = "0.2.0"
+description = "Glyph: decentralized AI serving/training network with ERC20 token rewards"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Glyph Team" }]
+dependencies = [
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "websockets>=12.0",
+  "httpx>=0.27",
+  "requests>=2.31",
+  "pyyaml>=6.0",
+  "cryptography>=42.0",
+  "sqlalchemy>=2.0",
+  "aiosqlite>=0.20",
+  "transformers>=4.44",
+  "accelerate>=0.32",
+  "torch>=2.2; platform_system != 'Darwin' or platform_machine != 'arm64'",
+  # Web3 for ERC20 rewards
+  "web3>=6.0.0",
+  "eth-account>=0.10.0",
+]
+
+[project.optional-dependencies]
+dev = ["black>=24.4", "ruff>=0.4"]
+dht = ["hivemind>=1.2"]
+bots = [
+  "python-telegram-bot>=20.0",
+  "httpx>=0.27",
+]
+all = [
+  "hivemind>=1.2",
+  "python-telegram-bot>=20.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+glyph = "glyph.__main__:main"
+
+
