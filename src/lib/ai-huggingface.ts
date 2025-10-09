@@ -31,7 +31,6 @@ try { setDefaultResultOrder('ipv4first'); } catch {}
 
 function buildHeaders(kind: 'json' | 'file' = 'json'): Record<string, string> {
   const headers: Record<string, string> = {
-    'User-Agent': 'DialAI/1.0 (+https://dial.wtf)'
   };
   const token = process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN;
   if (token) headers['Authorization'] = `Bearer ${token}`;
@@ -40,18 +39,18 @@ function buildHeaders(kind: 'json' | 'file' = 'json'): Record<string, string> {
   return headers;
 }
 
-async function fetchWithRetry(url: string, init: RequestInit & { timeoutMs?: number } = {}, attempts = 3): Promise<Response> {
+export async function fetchWithRetry(url: string, init: RequestInit & { timeoutMs?: number } = {}, attempts = 3): Promise<Response> {
   let lastErr: any;
   for (let i = 0; i < attempts; i++) {
-    const timeoutMs = init.timeoutMs || 30000;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timeoutMs = typeof init.timeoutMs === 'number' ? init.timeoutMs : 60000; // 1 minute
+    const controller = timeoutMs > 0 ? new AbortController() : undefined;
+    const timer = timeoutMs > 0 ? setTimeout(() => controller!.abort(), timeoutMs) : undefined;
     try {
-      const res = await fetch(url, { ...init, signal: controller.signal });
-      clearTimeout(timer);
+      const res = await fetch(url, controller ? { ...init, signal: controller.signal } : init);
+      if (timer) clearTimeout(timer);
       return res;
     } catch (err) {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       lastErr = err;
       // simple backoff: 500ms, 1500ms
       if (i < attempts - 1) {
@@ -148,7 +147,8 @@ export async function downloadHFFile(
   // Create directory if it doesn't exist
   await mkdir(dirname(outputPath), { recursive: true });
   
-  const response = await fetchWithRetry(downloadUrl, { headers: buildHeaders('file'), timeoutMs: 120000 }, 3);
+  // Large model files can take a long time; disable overall request timeout
+  const response = await fetchWithRetry(downloadUrl, { headers: buildHeaders('file'), timeoutMs: 0 }, 3);
   
   if (!response.ok) {
     const text = await response.text().catch(() => '');

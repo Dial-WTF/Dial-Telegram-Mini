@@ -7,10 +7,13 @@
 import type { ChatMessage, ChatRequest, ChatResponse, ModelServeConfig } from '@/types/ai-model';
 import { getModelById, updateModelStatus, getServeStatus, updateServeStatus } from './ai-model-storage';
 import { saveModel } from './ai-model-storage';
+import { getPeerId, getRegistryUrl } from './swarm-client';
+import { createHash } from 'crypto';
 import { spawn, ChildProcess } from 'child_process';
 
 // Store running inference processes
 const runningProcesses = new Map<string, ChildProcess>();
+const claimIntervals = new Map<string, NodeJS.Timer>();
 
 /**
  * Start serving a model using llama.cpp server
@@ -21,7 +24,6 @@ export async function startModelServer(config: ModelServeConfig): Promise<void> 
   if (!model) {
     throw new Error('Model not found');
   }
-  
   if (!model.localPath) {
     throw new Error('Model file path not found');
   }
@@ -98,6 +100,24 @@ export async function startModelServer(config: ModelServeConfig): Promise<void> 
       modelId: config.modelId,
       isServing: false,
     });
+    // Release serve claim and stop refresher
+    try {
+      const timer = claimIntervals.get(config.modelId);
+      if (timer) { clearInterval(timer as any); claimIntervals.delete(config.modelId); }
+      const base = (process.env.PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+      const peerId = getPeerId(base);
+      const m = getModelById(config.modelId);
+      if (m) {
+        const codeStr = m.infoHash
+          ? String(m.infoHash).slice(0,7).toLowerCase()
+          : createHash('sha1').update(m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id).digest('hex').slice(0,7).toLowerCase();
+        const registry = getRegistryUrl(base);
+        fetch(`${registry}/api/swarm/claim?code=${encodeURIComponent(codeStr)}&peerId=${encodeURIComponent(peerId)}`, {
+          method: 'DELETE',
+          signal: AbortSignal.timeout(4000),
+        }).catch(() => {});
+      }
+    } catch {}
   });
   
   // Poll health until server is ready (max ~20s)
@@ -136,21 +156,50 @@ export async function startModelServer(config: ModelServeConfig): Promise<void> 
   });
   console.log(`[Inference] Server started for ${config.modelId} on ${host}:${port}`);
 
-  // Ensure seeding: if model has localPath but no infoHash, create a torrent and keep seeding
+  // Maintain a serve-claim while serving to avoid duplicates across peers
   try {
-    if (!model.infoHash && model.localPath) {
-      const { createModelTorrent } = await import('./ai-torrent-manager');
-      const { magnetUri, infoHash } = await createModelTorrent(config.modelId, model.localPath);
-      const updated = getModelById(config.modelId);
-      if (updated) {
-        (updated as any).magnetUri = magnetUri;
-        (updated as any).infoHash = infoHash;
-        saveModel(updated);
-        console.log(`[Inference] Seeding enabled for ${config.modelId}`);
-      }
+    const base = (process.env.PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+    const peerId = getPeerId(base);
+    const registry = getRegistryUrl(base);
+    const m = getModelById(config.modelId);
+    if (m) {
+      const code = m.infoHash
+        ? String(m.infoHash).slice(0,7).toLowerCase()
+        : createHash('sha1').update(m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id).digest('hex').slice(0,7).toLowerCase();
+      // Immediately claim and then refresh periodically
+      const claimOnce = async () => {
+        try {
+          await fetch(`${registry}/api/swarm/claim`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code, peerId, ttlMs: 60000 }),
+            signal: AbortSignal.timeout(4000),
+          });
+        } catch {}
+      };
+      await claimOnce();
+      const timer = setInterval(() => { claimOnce(); }, 30000);
+      claimIntervals.set(config.modelId, timer);
     }
-  } catch (err) {
-    console.warn('[Inference] Failed to enable seeding:', err);
+  } catch {}
+
+  // Optional: enable file seeding only if explicitly requested
+  if (process.env.ENABLE_TORRENTS === '1') {
+    try {
+      if (!model.infoHash && model.localPath) {
+        const { createModelTorrent } = await import('./ai-torrent-manager');
+        const { magnetUri, infoHash } = await createModelTorrent(config.modelId, model.localPath);
+        const updated = getModelById(config.modelId);
+        if (updated) {
+          (updated as any).magnetUri = magnetUri;
+          (updated as any).infoHash = infoHash;
+          saveModel(updated);
+          console.log(`[Inference] Seeding enabled for ${config.modelId}`);
+        }
+      }
+    } catch (err) {
+      console.warn('[Inference] Failed to enable seeding:', err);
+    }
   }
 }
 
@@ -311,4 +360,31 @@ export async function checkServerHealth(modelId: string): Promise<boolean> {
   } catch (err) {
     return false;
   }
+}
+
+/**
+ * Generate the next token (best-effort) using llama.cpp completion with n_predict=1.
+ */
+export async function nextToken(modelId: string, prompt: string, temperature: number = 0.7): Promise<string> {
+  const serveStatus = getServeStatus(modelId);
+  if (!serveStatus?.isServing) {
+    throw new Error('Model is not being served');
+  }
+  const url = `http://${serveStatus.host}:${serveStatus.port}/completion`;
+  const payload = {
+    prompt,
+    n_predict: 1,
+    temperature,
+  } as any;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(`Next token failed: ${response.statusText}`);
+  }
+  const data = await response.json();
+  const token: string = data?.content || '';
+  return token;
 }

@@ -8,18 +8,17 @@ import { fetchPayCalldata, extractForwarderInputs } from '#/lib/requestApi';
 import { bpsToPercentString } from '#/lib/fees';
 import { buildEthereumUri, decodeProxyDataAndValidateValue } from '#/lib/ethUri';
 import { buildPredictTenderlyInput, predictDestinationTenderly, createIncomingPaymentAlert } from '#/lib/tenderlyApi';
-  import { createAddressActivityWebhook, updateWebhookAddresses } from '#/lib/alchemyWebhooks';
 import ForwarderArtifact from '#/lib/contracts/DepositForwarderMinimal/DepositForwarderMinimal.json';
 import { keccak256, toHex } from 'viem';
 import { estimateGasAndPrice } from '#/lib/gas';
 import { buildQrForRequest } from '#/lib/qrUi';
 import { isValidEthereumAddress } from '#/lib/utils';
 import { requestContextById, predictContextByAddress, requestIdByPredictedAddress } from '#/lib/mem';
-import { writeFile as writeS3File } from '#/services/s3/actions/writeFile';
-import { s3 } from '#/services/s3/client';
-import { GetObjectCommand } from '@aws-sdk/client-s3';
-import { AWS_S3_BUCKET } from '#/config/constants';
-import { PATH_INVOICES } from '#/services/s3/filepaths';
+// S3 disabled to avoid optional dependency issues at build time
+const S3_DISABLED = true as const;
+// Optional dependency stubs
+async function loadS3() { return null as any; }
+async function getPrivyClient() { return null as any; }
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
 const pendingAddressByUser = new Map<number, { amount: number; note: string }>();
@@ -55,27 +54,25 @@ async function tgCall(method: string, payload: any): Promise<any> {
   }
 }
 
-// Lazy-initialize Privy client at runtime to avoid build-time dependency
-async function getPrivyClient() {
-  if (!process.env.PRIVY_APP_ID || !process.env.PRIVY_APP_SECRET) return null;
-  try {
-    const mod = await import('@privy-io/node');
-    // @ts-ignore - runtime import
-    const client = new mod.PrivyClient({
-      appId: process.env.PRIVY_APP_ID as string,
-      appSecret: process.env.PRIVY_APP_SECRET as string,
-    });
-    return client;
-  } catch {
-    return null;
-  }
-}
+// Privy usage disabled; remove to avoid optional dependency resolution
 
 // Minimal webhook endpoint for Telegram bot commands via Bot API webhook
 // Set this path as your webhook URL: <PUBLIC_BASE_URL>/api/bot
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
+    let body: any = {};
+    try {
+      body = await req.json();
+    } catch {
+      // Telegram may occasionally send empty body or invalid JSON; treat as noop
+      body = {};
+    }
+    // Swarm heartbeat: periodically register this node and its models
+    try {
+      const serverBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+      const { ensureSwarmHeartbeat } = await import('@/lib/swarm-init');
+      ensureSwarmHeartbeat(serverBase);
+    } catch {}
     // Handle callback queries for status refresh
     const callback = body?.callback_query;
     if (callback && callback.id && callback.message && typeof callback.data === 'string') {
@@ -121,8 +118,11 @@ export async function POST(req: NextRequest) {
           }
           if (!reqId) throw new Error('request id not found');
         } catch (err: any) {
-          // Fallback: look up requestId by chatId/messageId from S3 index
+          // Fallback: look up requestId by chatId/messageId from S3 index (optional)
           try {
+            const s3env = await loadS3();
+            if (!s3env) throw new Error('S3 not configured');
+            const { s3, GetObjectCommand, AWS_S3_BUCKET, PATH_INVOICES } = s3env as any;
             const key = `${PATH_INVOICES}by-message/${chatIdCb}/${messageIdCb}.json`;
             const obj = await s3.send(new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key }));
             const text = await (obj.Body as any).transformToString();
@@ -265,6 +265,10 @@ export async function POST(req: NextRequest) {
       });
       return NextResponse.json({ ok: true });
     }
+
+    
+
+    
 
     // Handle callback queries (inline button presses)
     const callbackQuery = body?.callback_query;
@@ -481,9 +485,153 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // /ask <message> - Ask AI in any chat (group-friendly)
+    // /ai-seeding, /ai_seeding, or /aiseeding - Show swarm seeding status and short codes
+    if (/^\/ai[-_]?seeding\b/i.test(text)) {
+      try {
+        const { listAggregated } = await import('@/lib/swarm-client');
+        const { getAllModels } = await import('@/lib/ai-model-storage');
+        const serverBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const aggregated = await listAggregated(serverBase).catch(() => [] as any[]);
+
+        let message = '🌐 *AI Seeding (Swarm)*\n\n';
+        if (aggregated && aggregated.length > 0) {
+          aggregated.slice(0, 25).forEach((e: any, idx: number) => {
+            message += `${idx + 1}. ${e.name}  (\`${e.code}\`)\n`;
+            message += `   Nodes: ${e.nodes}  Seeders: ${e.totalSeeders}  Peers: ${e.peers}\n`;
+            const sample = e.examples?.slice(0, 3).map((x: any) => `${x.status}${typeof x.seeders === 'number' ? `:${x.seeders}` : ''}`).join(', ');
+            if (sample) message += `   Examples: ${sample}\n`;
+            message += `\n`;
+          });
+          message += 'Use `/ask <message> #<code>` to target a model. Omit the code to auto-pick the most-seeded model.';
+        } else {
+          // Fallback to local-only list
+          const models = getAllModels().filter(m => m.status === 'serving' || m.status === 'ready');
+          models.sort((a, b) => (a.status === 'serving' ? -1 : 1) - (b.status === 'serving' ? -1 : 1));
+          if (models.length === 0) {
+            message += 'No models are currently serving or ready. Use `/ai-serve <model_id>` to start one.';
+          } else {
+            const { createHash } = await import('crypto');
+            const codeFor = (m: any) => {
+              if (m.infoHash) return String(m.infoHash).slice(0,7).toLowerCase();
+              const basis = m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
+              return createHash('sha1').update(basis).digest('hex').slice(0,7).toLowerCase();
+            };
+            models.slice(0, 25).forEach((m, idx) => {
+              const code = codeFor(m);
+              message += `${idx + 1}. ${m.name || m.id}  (\`${code}\`)\n`;
+              message += `   Status: ${m.status}  Peers: ${m.peers || 0}\n`;
+              const prog = typeof m.downloadProgress === 'number' ? `  ${Math.round(m.downloadProgress)}%` : '';
+              message += `   Status: ${m.status}${prog}\n\n`;
+            });
+          }
+        }
+
+        await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+      } catch (err: any) {
+        await tgCall('sendMessage', { chat_id: chatId, text: `Error: ${err?.message || 'unknown'}` });
+      }
+      return NextResponse.json({ ok: true });
+    }
+
+    // /miner - Dashboard of this node (hardware, OS, load, serving, seeding)
+    if (/^\/miner\b/i.test(text)) {
+      try {
+        const { getServingModels, getAllModels, getServeStatus, formatBytes } = await import('@/lib/ai-model-storage');
+        const { createHash } = await import('crypto');
+        const { getPeerId } = await import('@/lib/swarm-client');
+        const os = await import('os');
+        const base = (process.env.PUBLIC_BASE_URL || req.nextUrl.origin).replace(/\/$/, '');
+        const peerId = getPeerId(base);
+
+        // System / hardware
+        const cpus = typeof os.cpus === 'function' ? os.cpus() : [] as any[];
+        const cpuModel = cpus[0]?.model || 'Unknown CPU';
+        const cores = cpus.length || 0;
+        const arch = typeof os.arch === 'function' ? os.arch() : process.arch;
+        const platform = typeof os.platform === 'function' ? os.platform() : process.platform;
+        const release = typeof os.release === 'function' ? os.release() : '';
+        const totalMemB = typeof os.totalmem === 'function' ? os.totalmem() : 0;
+        const freeMemB = typeof os.freemem === 'function' ? os.freemem() : 0;
+        const load = typeof os.loadavg === 'function' ? os.loadavg() : [0,0,0];
+        const sysUptimeSec = typeof os.uptime === 'function' ? Math.floor(os.uptime()) : 0;
+        const nodeVer = process.versions?.node || '';
+        const procUptimeSec = Math.floor(process.uptime());
+
+        const serving = getServingModels();
+        const allModels = getAllModels();
+        const now = Date.now();
+        const codeFor = (m: any) => {
+          if (m.infoHash) return String(m.infoHash).slice(0,7).toLowerCase();
+          const basis = m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
+          return createHash('sha1').update(basis).digest('hex').slice(0,7).toLowerCase();
+        };
+
+        const fmtUptime = (s: number) => s < 3600
+          ? `${Math.floor(s/60)}m ${s%60}s`
+          : `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+
+        let message = '';
+        message += `⛏️ *Miner Dashboard*\n`;
+        message += `Peer: \`${peerId}\`\n`;
+        message += `Base: ${base}  Port: 3000\n\n`;
+
+        message += `🖥️ *Hardware*\n`;
+        message += `CPU: ${cpuModel}  Cores: ${cores}  Arch: ${arch}\n`;
+        message += `Memory: ${formatBytes(totalMemB)} total, ${formatBytes(freeMemB)} free\n\n`;
+
+        message += `🧰 *System*\n`;
+        message += `OS: ${platform} ${release}  Node: v${nodeVer}\n`;
+        message += `Load (1/5/15m): ${load.map(n => n.toFixed(2)).join('/')}\n`;
+        message += `Uptime: sys ${fmtUptime(sysUptimeSec)}  proc ${fmtUptime(procUptimeSec)}\n\n`;
+
+        if (serving.length === 0) {
+          message += 'No models are currently serving on this node.\n\nUse `/ai-serve <model_id>` to start one.';
+        } else {
+          let totalReq = 0;
+          let totalUptimeSec = 0;
+          let totalUploaded = 0;
+          message += `🤖 *Serving* (${serving.length})\n`;
+          for (const m of serving) {
+            const st = getServeStatus(m.id);
+            const startedAt = st?.startedAt || 0;
+            const uptimeSec = startedAt ? Math.max(1, Math.floor((now - startedAt) / 1000)) : 0;
+            const req = st?.requestCount || 0;
+            const err = st?.errorCount || 0;
+            const rpm = uptimeSec > 0 ? (req / (uptimeSec / 60)).toFixed(2) : '0.00';
+            const uploaded = typeof m.uploadedBytes === 'number' ? m.uploadedBytes : 0;
+            const code = codeFor(m);
+            totalReq += req;
+            totalUptimeSec += uptimeSec;
+            totalUploaded += uploaded;
+            const upPretty = fmtUptime(uptimeSec);
+            message += `• ${m.name || m.id} (\`${code}\`)\n`;
+            message += `   Uptime: ${upPretty}  Requests: ${req}  Errors: ${err}  Rate: ${rpm}/min\n`;
+            message += `   Seeding: ${formatBytes(uploaded)}  Seeders: ${m.seeders || 0}\n`;
+            message += `\n`;
+          }
+          const avgRpm = totalUptimeSec > 0 ? (totalReq / (totalUptimeSec / 60)).toFixed(2) : '0.00';
+          message += `📈 *Totals*\n`;
+          message += `Compute rate (avg): ${avgRpm} req/min\n`;
+          message += `Uploaded (all models): ${formatBytes(totalUploaded)}\n`;
+          message += `\n`;
+          message += `Note: compute rate is approximated from request counts and uptime. Token-level accounting will be added later.\n`;
+        }
+
+        await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+      } catch (err: any) {
+        await tgCall('sendMessage', { chat_id: chatId, text: `Error: ${err?.message || 'unknown'}` });
+      }
+      return NextResponse.json({ ok: true });
+    }
+
+    // /ask <message> [#<7hex>] - Ask AI in any chat (group-friendly)
     if (/^\/ask\b/i.test(text)) {
-      const question = text.replace(/^\/ask\b/i, '').trim();
+      let question = text.replace(/^\/ask\b/i, '').trim();
+      const codeMatch = question.match(/#([a-f0-9]{7})\b/i);
+      const requestedCode = codeMatch?.[1]?.toLowerCase();
+      if (requestedCode) {
+        question = question.replace(/#([a-f0-9]{7})\b/i, '').trim();
+      }
       if (!question) {
         await tgCall('sendMessage', { chat_id: chatId, text: 'Usage: /ask <message>\n\nExample: /ask explain JSON in one sentence' });
         return NextResponse.json({ ok: true });
@@ -491,34 +639,135 @@ export async function POST(req: NextRequest) {
 
       try {
         const { getActiveSession, getSessionMessages, addMessageToSession, getChatSession } = await import('@/lib/ai-chat-session');
-        const { getServingModels } = await import('@/lib/ai-model-storage');
+        const { getServingModels, getAllModels } = await import('@/lib/ai-model-storage');
+        const { listAggregated, remoteChat } = await import('@/lib/swarm-client');
+        const { chat } = await import('@/lib/ai-inference');
+        const { createHash } = await import('crypto');
 
-        // Pick model: active session for this user+chat, else single serving model
-        let modelId = getActiveSession(tgUserId, chatId)?.modelId;
-        if (!modelId) {
-          const serving = getServingModels();
-          if (serving.length === 1) modelId = serving[0].id;
-        }
-
-        if (!modelId) {
-          // No active or unambiguous serving model — show selector
-          const { handleAiChatCommand } = await import('@/lib/bot/ai-commands');
-          const { message, keyboard } = handleAiChatCommand();
-          await tgCall('sendMessage', { chat_id: chatId, text: message + '\n\nTip: Use /ai-serve <model_id> first, then retry /ask.', parse_mode: 'Markdown', reply_markup: keyboard });
-          return NextResponse.json({ ok: true });
-        }
-
-        // Ensure session exists on this user+chat+model
-        getChatSession(tgUserId, chatId, modelId);
+        // Append user message to session regardless of routing path
+        const session = getChatSession(tgUserId, chatId, ''); // placeholder session, will set model below
         addMessageToSession(tgUserId, chatId, { role: 'user', content: question });
         const messages = getSessionMessages(tgUserId, chatId);
 
-        // Call AI directly (no internal HTTP hop)
-        const { chat } = await import('@/lib/ai-inference');
-        const data = await chat({ modelId, messages, maxTokens: 512, temperature: 0.7, stream: false });
-        const aiResponse = data.content || 'No response';
-        addMessageToSession(tgUserId, chatId, { role: 'assistant', content: aiResponse });
-        await tgCall('sendMessage', { chat_id: chatId, text: aiResponse });
+        const serverBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const aggregated = await listAggregated(serverBase).catch(() => [] as any[]);
+
+        const norm = (u: string) => u.replace(/\/$/, '').toLowerCase();
+        const isSelf = (u: string) => norm(u) === norm(serverBase);
+
+        let answered = false;
+        let chosenModelId: string | undefined;
+
+        if (aggregated && aggregated.length > 0) {
+          // If multiple peers can do next_token, use the composer
+          try {
+            const preferCode = (requestedCode && requestedCode.toLowerCase()) || String(aggregated[0]?.code || '').toLowerCase();
+            if (preferCode) {
+              const entry = aggregated.find((e: any) => String(e.code).toLowerCase() === preferCode);
+              const examples = Array.isArray(entry?.examples) ? entry.examples : [];
+              const capable = examples.filter((ex: any) => ex && ex.status === 'serving' && ex.publicUrl && (Array.isArray(ex.capabilities) ? ex.capabilities.includes('next_token') : true));
+              if (capable.length >= 2) {
+                const compUrl = `${serverBase.replace(/\/$/, '')}/api/swarm/relay/compose`;
+                const res = await fetch(compUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ code: preferCode, prompt: question, maxTokens: 256, temperature: 0.7 }),
+                  signal: AbortSignal.timeout(60000),
+                });
+                if (res.ok) {
+                  const json = await res.json();
+                  const aiResponse = String(json?.text || '');
+                  if (aiResponse) {
+                    addMessageToSession(tgUserId, chatId, { role: 'assistant', content: aiResponse });
+                    await tgCall('sendMessage', { chat_id: chatId, text: aiResponse });
+                    answered = true;
+                  }
+                }
+              }
+            }
+          } catch {}
+          if (answered) {
+            return NextResponse.json({ ok: true });
+          }
+          // Build a best-first list of candidate examples across entries
+          const entries = requestedCode
+            ? aggregated.filter((e: any) => String(e.code).toLowerCase() === requestedCode)
+            : [...aggregated].sort((a: any, b: any) => (b.nodes - a.nodes) || (b.totalSeeders - a.totalSeeders));
+
+          const candidates: { publicUrl: string; modelId: string; status: string; seeders?: number }[] = [];
+          for (const e of entries) {
+            const examples = Array.isArray(e.examples) ? [...e.examples] : [];
+            examples.sort((a: any, b: any) => {
+              const sA = a.status === 'serving' ? 1 : 0;
+              const sB = b.status === 'serving' ? 1 : 0;
+              if (sA !== sB) return sB - sA;
+              return (b.seeders || 0) - (a.seeders || 0);
+            });
+            for (const ex of examples) {
+              candidates.push({ publicUrl: ex.publicUrl, modelId: ex.modelId, status: ex.status, seeders: ex.seeders });
+            }
+          }
+
+          // Try remote peers first (non-self), best-first; collect a local candidate as fallback
+          for (const c of candidates) {
+            if (!c.publicUrl) continue;
+            if (isSelf(c.publicUrl)) { chosenModelId = chosenModelId || c.modelId; continue; }
+            try {
+              const result = await remoteChat(c.publicUrl, c.modelId, messages, 512, 0.7);
+              const aiResponse = result.content || 'No response';
+              addMessageToSession(tgUserId, chatId, { role: 'assistant', content: aiResponse });
+              await tgCall('sendMessage', { chat_id: chatId, text: aiResponse });
+              answered = true;
+              break;
+            } catch (e) {
+              // Try next candidate on failure
+              try { console.warn('[Swarm] remoteChat failed for', c.publicUrl, (e as any)?.message || e); } catch {}
+              continue;
+            }
+          }
+        }
+
+        if (!answered) {
+          // Local routing fallback
+          let modelId = getActiveSession(tgUserId, chatId)?.modelId;
+          const serving = getServingModels();
+
+          // If registry gave us a local modelId, prioritize it
+          if (!modelId && chosenModelId) modelId = chosenModelId;
+
+          // If a short code is provided, try to match it locally
+          if (!modelId && requestedCode) {
+            const codeFor = (m: any) => {
+              if (m.infoHash) return String(m.infoHash).slice(0,7).toLowerCase();
+              const basis = m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
+              return createHash('sha1').update(basis).digest('hex').slice(0,7).toLowerCase();
+            };
+            const match = serving.find(m => codeFor(m) === requestedCode) || getAllModels().find(m => codeFor(m) === requestedCode);
+            if (match) modelId = match.id;
+          }
+
+          if (!modelId) {
+            if (serving.length === 1) {
+              modelId = serving[0].id;
+            } else if (serving.length > 1) {
+              modelId = serving[0]?.id;
+            }
+          }
+
+          if (!modelId) {
+            const { handleAiChatCommand } = await import('@/lib/bot/ai-commands');
+            const { message, keyboard } = handleAiChatCommand();
+            await tgCall('sendMessage', { chat_id: chatId, text: message + '\n\nTip: Use /ai-seeding to view codes, then `/ask <message> #<code>` or start a server with `/ai-serve <model_id>`.', parse_mode: 'Markdown', reply_markup: keyboard });
+            return NextResponse.json({ ok: true });
+          }
+
+          // Ensure session exists on this user+chat+model and run locally
+          getChatSession(tgUserId, chatId, modelId);
+          const data = await chat({ modelId, messages, maxTokens: 512, temperature: 0.7, stream: false });
+          const aiResponse = data.content || 'No response';
+          addMessageToSession(tgUserId, chatId, { role: 'assistant', content: aiResponse });
+          await tgCall('sendMessage', { chat_id: chatId, text: aiResponse });
+        }
       } catch (err: any) {
         await tgCall('sendMessage', { chat_id: chatId, text: `Error: ${err?.message || 'unknown'}` });
       }
@@ -1089,7 +1338,7 @@ export async function POST(req: NextRequest) {
         (async () => {
           try {
             const { addModelFromHuggingFace } = await import('@/lib/ai-model-manager');
-            await addModelFromHuggingFace({ huggingFaceUrl: url, createTorrent: true });
+            await addModelFromHuggingFace({ huggingFaceUrl: url, createTorrent: false });
           } catch (e) {
             try { console.error('[Bot] AI download error:', e); } catch {}
           }
@@ -1101,16 +1350,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // /ai-list - List downloaded models
-    if (/^\/ai-list\b/i.test(text)) {
+    // /ai-list, /ai_list, or /ailist - List downloaded models
+    if (/^\/ai[-_]?list\b/i.test(text)) {
       const { handleAiListCommand } = await import('@/lib/bot/ai-commands');
       const message = handleAiListCommand();
       await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
       return NextResponse.json({ ok: true });
     }
 
-    // /ai-serve <model_id> - Start serving a model
-    if (/^\/ai-serve\b/i.test(text)) {
+    // /ai-serve, /ai_serve, or /aiserve <model_id> - Start serving a model
+    if (/^\/ai[-_]?serve\b/i.test(text)) {
       const { handleAiServeCommand, getServeSelectionKeyboard } = await import('@/lib/bot/ai-commands');
       const parts = text.split(/\s+/);
       const modelId = parts[1];
@@ -1124,7 +1373,30 @@ export async function POST(req: NextRequest) {
 
       await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
 
-      // Start serving directly and open chat session
+      // Federated serving policy: if a remote peer is already serving this model code, don't start locally.
+      try {
+        const { getModelById } = await import('@/lib/ai-model-storage');
+        const m = getModelById(modelId);
+        if (m) {
+          const serverBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+          const norm = (u: string) => u.replace(/\/$/, '').toLowerCase();
+          const isSelf = (u: string) => norm(u) === norm(serverBase);
+          const { listAggregated } = await import('@/lib/swarm-client');
+          const { createHash } = await import('crypto');
+          const code = m.infoHash
+            ? String(m.infoHash).slice(0,7).toLowerCase()
+            : createHash('sha1').update(m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id).digest('hex').slice(0,7).toLowerCase();
+          const aggregated = await listAggregated(serverBase).catch(() => [] as any[]);
+          const entry = aggregated.find((e: any) => String(e.code).toLowerCase() === code);
+          const remoteServing = entry?.examples?.find((ex: any) => ex.status === 'serving' && ex.publicUrl && !isSelf(ex.publicUrl));
+          if (remoteServing) {
+            await tgCall('sendMessage', { chat_id: chatId, text: `🤝 A peer is already serving this model (code: \`${code}\`).\n\nSkipping local server to federate. Use \`/ask <message> #${code}\` or just \`/ask ...\` to auto-route.`, parse_mode: 'Markdown' });
+            return NextResponse.json({ ok: true });
+          }
+        }
+      } catch {}
+
+      // Start serving directly and open chat session (no remote peer serving)
       try {
         const { startModelServer } = await import('@/lib/ai-inference');
         await startModelServer({ modelId });
@@ -1147,8 +1419,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // /ai-chat <model_id> - Manually start a chat session with a serving model
-    if (/^\/ai-chat\b/i.test(text)) {
+    // /ai-chat, /ai_chat, or /aichat <model_id> - Manually start a chat session with a serving model
+    if (/^\/ai[-_]?chat\b/i.test(text)) {
       const parts = text.split(/\s+/);
       const modelId = parts[1];
       if (!modelId) {
@@ -1176,8 +1448,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // /ai-stop <model_id> - Stop serving a model
-    if (/^\/ai-stop\b/i.test(text)) {
+    // /ai-stop, /ai_stop, or /aistop <model_id> - Stop serving a model
+    if (/^\/ai[-_]?stop\b/i.test(text)) {
       const parts = text.split(/\s+/);
       const modelId = parts[1];
 
@@ -1204,16 +1476,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // /ai-help - AI commands help
-    if (/^\/ai-help\b/i.test(text)) {
+    // /ai-help, /ai_help, or /aihelp - AI commands help
+    if (/^\/ai[-_]?help\b/i.test(text)) {
       const { getAiHelpMessage } = await import('@/lib/bot/ai-commands');
       const message = getAiHelpMessage();
       await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
       return NextResponse.json({ ok: true });
     }
 
-    // /ai-setup - Provide one-click OS-specific installers
-    if (/^\/ai-setup\b$/i.test(text)) {
+    // /ai-setup, /ai_setup, or /aisetup - Provide one-click OS-specific installers
+    if (/^\/ai[-_]?setup\b$/i.test(text)) {
       const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
       const macPkgUrl = process.env.MAC_INSTALLER_URL; // Signed & notarized PKG
       const message = (
@@ -1248,8 +1520,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // /ai-setup-gpu - Highlight Linux GPU installer
-    if (/^\/ai-setup-gpu\b$/i.test(text)) {
+    // /ai-setup-gpu, /ai_setup_gpu, or /aisetupgpu - Highlight Linux GPU installer
+    if (/^\/ai[-_]?setup[-_]?gpu\b$/i.test(text)) {
       const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
       const message = (
         `🛠️ *One-Click GPU Installer (Linux CUDA)*\n\n` +
@@ -1277,8 +1549,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true });
     }
 
-    // /ai-clear - Clear chat session
-    if (/^\/ai-clear\b/i.test(text)) {
+    // /ai-clear, /ai_clear, or /aiclear - Clear chat session
+    if (/^\/ai[-_]?clear\b/i.test(text)) {
       const { clearSession } = await import('@/lib/ai-chat-session');
       clearSession(tgUserId, chatId);
       await reply('🗑️ Chat session cleared. Use /ai to start a new conversation.');
@@ -1481,12 +1753,18 @@ export async function POST(req: NextRequest) {
               });
               requestIdByPredictedAddress.set(String(predicted).toLowerCase(), id);
             } catch {}
-            // Persist invoice metadata to S3 for later lookup by predicted address
+            // Persist invoice metadata to S3 for later lookup by predicted address (optional)
             try {
               const tgUserName: string = (msg?.from?.username || '').toString();
               const lowerPred = String(predicted).toLowerCase();
               const fileName = `invoice-${lowerPred}-${tgUserName || 'anon'}-${id}.json`;
-              const s3Key = `${PATH_INVOICES}${fileName}`;
+              let s3Key = fileName;
+              try {
+                const s3env = await loadS3();
+                if (!s3env) throw new Error('S3 not configured');
+                const { PATH_INVOICES } = s3env as any;
+                s3Key = `${PATH_INVOICES}${fileName}`;
+              } catch {}
               savedInvoiceIndexKey = s3Key;
               const scanUrl = `https://scan.request.network/request/${id}`;
               const chainIdNum = Number(networkId) || 1;
@@ -1515,28 +1793,18 @@ export async function POST(req: NextRequest) {
                 createdAt: new Date().toISOString(),
               } as const;
               const body = Buffer.from(JSON.stringify(record, null, 2));
-              await writeS3File(s3Key, { Body: body, ContentType: 'application/json' });
+              try {
+                const s3env = await loadS3();
+                if (s3env?.writeS3File) {
+                  await (s3env as any).writeS3File(s3Key, { Body: body, ContentType: 'application/json' });
+                }
+              } catch {}
               if (DEBUG) { try { console.log('[BOT]/request saved invoice json to S3:', s3Key); } catch {} }
             } catch (e) {
               if (DEBUG) { try { console.warn('[BOT]/request failed to save invoice S3:', (e as any)?.message || e); } catch {} }
             }
-            // Register address activity on Alchemy webhook (create once, then update addresses)
-            try {
-              const alchemyWebhookId = process.env.ALCHEMY_WEBHOOK_ID;
-              if (alchemyWebhookId) {
-                await updateWebhookAddresses({ webhookId: alchemyWebhookId, add: [predicted as `0x${string}`], remove: [] });
-                if (DEBUG) {
-                  try { console.log('[BOT]/request alchemy: added address to webhook', { webhookId: alchemyWebhookId, address: predicted }); } catch {}
-                }
-              } else {
-                const created = await createAddressActivityWebhook({ addresses: [predicted as `0x${string}`] });
-                if (DEBUG) {
-                  try { console.log('[BOT]/request alchemy: created webhook', created); } catch {}
-                }
-              }
-            } catch (e) {
-              if (DEBUG) { try { console.warn('[BOT] alchemy webhook setup failed', { error: (e as any)?.message || e }); } catch {} }
-            }
+            // Optional: Alchemy webhook integration removed (no-op if not configured)
+            try { /* noop */ } catch {}
             // Action registration temporarily disabled; focusing on alert only
 
             // Build direct ETH URI to pay predicted deposit address
@@ -1559,19 +1827,18 @@ export async function POST(req: NextRequest) {
               replyMarkup: keyboard,
             });
           } catch {}
-          // Write by-request index to S3 for webhook lookup
+          // Write S3 indexes (optional)
           try {
-            const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
-            const idxPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
-            await writeS3File(idxKey, { Body: idxPayload, ContentType: 'application/json' });
-            if (DEBUG) { try { console.log('[BOT]/request wrote index file:', idxKey); } catch {} }
-          } catch {}
-          // Write by-message index to S3 for status callback lookup
-          try {
-            const byMsgKey = `${PATH_INVOICES}by-message/${chatId}/${messageId}.json`;
-            const byMsgPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
-            await writeS3File(byMsgKey, { Body: byMsgPayload, ContentType: 'application/json' });
-            if (DEBUG) { try { console.log('[BOT]/request wrote by-message index file:', byMsgKey); } catch {} }
+            const s3env = await loadS3();
+            if (s3env?.writeS3File) {
+              const { PATH_INVOICES } = s3env as any;
+              const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
+              const idxPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
+              await (s3env as any).writeS3File(idxKey, { Body: idxPayload, ContentType: 'application/json' });
+              const byMsgKey = `${PATH_INVOICES}by-message/${chatId}/${messageId}.json`;
+              const byMsgPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
+              await (s3env as any).writeS3File(byMsgKey, { Body: byMsgPayload, ContentType: 'application/json' });
+            }
           } catch {}
         }
 

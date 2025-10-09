@@ -1,3 +1,18 @@
+#### `/ai-seeding`
+Show decentralized swarm list with 7-char codes.
+
+Output includes:
+- Name and 7-char code (derived from infoHash or modelId)
+- Nodes (how many peers report this model)
+- Seeders/Peers (aggregated across peers)
+
+#### `/ask <message> [#<code>]`
+Ask a question.
+
+Routing rules:
+- If `#<code>` is provided, route to the best peer for that code (serving first, then most seeders), remotely if needed.
+- If no code, auto-pick the model with the most nodes/seeders.
+- Fallback: local serving model with the most seeders.
 # Decentralized AI System
 
 A peer-to-peer AI model distribution and inference system integrated with the Telegram bot.
@@ -5,10 +20,10 @@ A peer-to-peer AI model distribution and inference system integrated with the Te
 ## Overview
 
 This system allows users to:
-- Download AI models from HuggingFace via BitTorrent-style P2P distribution
 - Serve models locally for inference
-- Chat with AI models directly in Telegram
-- Share bandwidth with other users (automatic seeding)
+- Chat with AI models directly in Telegram (DMs and groups)
+- Participate in a decentralized serving swarm (Petals-style): peers register and route requests by short codes
+- Optional: download/share model files via BitTorrent-style P2P (disabled by default)
 
 ## Architecture
 
@@ -19,15 +34,21 @@ This system allows users to:
    - Status tracking (downloading, ready, serving, error)
    - P2P statistics (peers, upload/download bytes)
 
-2. **Torrent Manager** (`src/lib/ai-torrent-manager.ts`)
-   - WebTorrent integration for P2P file sharing
-   - Automatic seeding after download
-   - Progress tracking and peer management
+2. **Swarm Registry & Routing**
+   - Registry: `src/lib/swarm-registry.ts`
+   - Client helpers: `src/lib/swarm-client.ts`, heartbeat: `src/lib/swarm-init.ts`
+   - API endpoints:
+     - `POST /api/swarm/register` — peers announce served models and health
+     - `GET /api/swarm/models` — aggregated model list with 7-char codes
+     - `POST /api/swarm/relay/chat` — run inference locally on behalf of a remote peer
+   - Telegram wiring in `src/app/api/bot/route.ts`:
+     - `/ai-seeding` lists aggregated models from the registry (fallback to local)
+     - `/ask ... #<code>` routes to the best peer (serving first, then most seeders)
 
 3. **HuggingFace Integration** (`src/lib/ai-huggingface.ts`)
    - Model metadata fetching
    - Direct HTTP downloads from HuggingFace
-   - Automatic torrent creation for downloaded models
+   - Optional torrent creation for downloaded models (only if `ENABLE_TORRENTS=1`)
 
 4. **Model Manager** (`src/lib/ai-model-manager.ts`)
    - Coordinated download orchestration
@@ -38,6 +59,7 @@ This system allows users to:
    - llama.cpp server integration
    - OpenAI-compatible API
    - Multi-model serving support
+   - Health-gated startup; resolves `LLAMA_SERVER_BIN` automatically (Homebrew paths supported)
 
 6. **Chat Sessions** (`src/lib/ai-chat-session.ts`)
    - Multi-turn conversation management
@@ -219,9 +241,9 @@ Chat with a served model.
    sudo ln -s $(pwd)/llama-server /usr/local/bin/llama-server
    ```
 
-2. **Node.js dependencies**
+2. **Optional P2P file distribution**
    ```bash
-   pnpm install webtorrent
+   pnpm add webtorrent
    ```
 
 3. **Storage directories**
@@ -234,9 +256,17 @@ Chat with a served model.
 Add to `.env`:
 
 ```bash
-# AI Model Storage
+# Core
+PUBLIC_BASE_URL=               # https://<your-public-domain>
+LLAMA_SERVER_BIN=/opt/homebrew/bin/llama-server  # or your path
+
+# Swarm (Petals-style)
+SWARM_REGISTRY_URL=            # optional; defaults to PUBLIC_BASE_URL
+
+# Models (local storage)
 AI_MODEL_DIR=./models
-AI_TORRENT_DIR=./torrents
+AI_TORRENT_DIR=./torrents      # optional, only needed if torrents enabled
+ENABLE_TORRENTS=0              # 1 to enable torrent creation/seeding
 
 # Optional: GPU support
 LLAMA_CUBLAS=1
@@ -266,31 +296,13 @@ LLAMA_CUBLAS=1
    Hello, how are you?
    ```
 
-## P2P Features
+## Optional: P2P File Distribution
 
-### BitTorrent-Style Distribution
+If you wish to share model binaries via BitTorrent (not required for decentralized serving):
 
-- **Automatic Seeding**: Downloaded models are automatically shared via WebTorrent
-- **Peer Discovery**: Uses DHT, LSD, and WebSeeds for peer discovery
-- **Resume Support**: Interrupted downloads can be resumed
-- **Bandwidth Sharing**: Upload speeds contribute to the network
-
-### Statistics
-
-Each model tracks:
-- **Downloaded Bytes**: Total data received
-- **Uploaded Bytes**: Total data shared with peers
-- **Active Peers**: Current peer count
-- **Share Ratio**: Uploaded/Downloaded ratio
-
-### Magnet Links
-
-Models can be shared via magnet URIs:
-```
-magnet:?xt=urn:btih:[INFO_HASH]&dn=[MODEL_NAME]
-```
-
-Use `/ai-list` to see magnet links for downloaded models.
+- Set `ENABLE_TORRENTS=1` in `.env.local`
+- Install `webtorrent`
+- The app will create torrents on download and can show local peer counts
 
 ## Performance Considerations
 
@@ -350,4 +362,4 @@ Reduce context size:
 - [ ] Model quantization support
 - [ ] Multi-model routing
 - [ ] Web UI for model management
-- [ ] Distributed inference across multiple nodes
+- [x] Distributed inference across multiple nodes (registry + relay)

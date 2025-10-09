@@ -13,6 +13,7 @@ import {
 } from '@/lib/ai-model-storage';
 import { getServeStatus } from '@/lib/ai-model-storage';
 import type { AIModel } from '@/types/ai-model';
+import { createHash } from 'crypto';
 
 /**
  * Handle /ai command with URL
@@ -27,8 +28,7 @@ export async function handleAiDownloadCommand(url: string): Promise<string> {
   return (
     `🚀 *Starting Model Download*\n\n` +
     `URL: ${url}\n\n` +
-    `The model will be downloaded via P2P (BitTorrent-style) and shared with other users.\n\n` +
-    `⏳ This may take a while depending on model size and peer availability.\n\n` +
+    `⏳ This may take a while depending on file size and bandwidth.\n\n` +
     `Use \`/ai-list\` to check download progress.`
   );
 }
@@ -56,9 +56,13 @@ export function handleAiListCommand(): string {
     const statusEmoji = getStatusEmoji(model.status);
     const progress = model.downloadProgress;
     const size = formatBytes(model.size);
+    const code = model.infoHash
+      ? String(model.infoHash).slice(0, 7).toLowerCase()
+      : createHash('sha1').update(model.repoId && model.fileName ? `${model.repoId}::${model.fileName}` : model.id).digest('hex').slice(0, 7).toLowerCase();
 
     message += `${idx + 1}. ${statusEmoji} *${model.name}*\n`;
     message += `   ID: \`${model.id}\`\n`;
+    message += `   Code: \`${code}\`\n`;
     message += `   Status: ${model.status.toUpperCase()}`;
 
     if (model.status === 'downloading') {
@@ -75,10 +79,6 @@ export function handleAiListCommand(): string {
       if (serveStatus) {
         message += `   🌐 Serving on ${serveStatus.host}:${serveStatus.port}\n`;
       }
-    }
-
-    if (model.magnetUri) {
-      message += `   🧲 Torrent: Available\n`;
     }
 
     message += `\n`;
@@ -206,8 +206,6 @@ export function getModelStatsMessage(modelId: string): string {
 
   const statusEmoji = getStatusEmoji(model.status);
   const size = formatBytes(model.size);
-  const downloaded = formatBytes(model.downloadedBytes);
-  const uploaded = formatBytes(model.uploadedBytes);
 
   let message = `📊 *Model Statistics*\n\n`;
   message += `Name: *${model.name}*\n`;
@@ -217,17 +215,6 @@ export function getModelStatsMessage(modelId: string): string {
   message += `📦 *Storage*\n`;
   message += `Size: ${size}\n`;
   message += `Format: ${model.format}\n\n`;
-
-  message += `🌐 *P2P Stats*\n`;
-  message += `Downloaded: ${downloaded}\n`;
-  message += `Uploaded: ${uploaded}\n`;
-  message += `Peers: ${model.peers}\n`;
-
-  if (model.magnetUri) {
-    message += `\n🧲 *Torrent Available*\n`;
-    message += `Share this magnet link:\n`;
-    message += `\`${model.magnetUri.slice(0, 100)}...\``;
-  }
 
   const serveStatus = getServeStatus(modelId);
   if (serveStatus?.isServing) {
@@ -303,11 +290,6 @@ export function getAiHelpMessage(): string {
     `\`/ai-serve <model_id>\` - Start serving a model\n` +
     `\`/ai-stop <model_id>\` - Stop serving\n\n` +
     `*Chat:*\n` +
-    `\`/ai\` - Select model and chat\n\n` +
-    `💡 *P2P Features:*\n` +
-    `• Models are downloaded BitTorrent-style\n` +
-    `• You automatically share with other users\n` +
-    `• Faster downloads with more peers\n` +
-    `• Decentralized and censorship-resistant`
+    `\`/ai\` - Select model and chat`
   );
 }

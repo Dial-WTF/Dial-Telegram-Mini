@@ -31,6 +31,19 @@ class SignReceiptRequest(BaseModel):
     # accept passthrough fields
 
 
+class NextTokenRequest(BaseModel):
+    prompt: str
+    temperature: float = 0.7
+
+
+class NextTokenResponse(BaseModel):
+    token: str
+    token_id: int
+    input_tokens: int
+    output_tokens: int
+    wall_time_ms: int
+
+
 def build_app(
     model_path: str,
     gateway_url: str | None = None,
@@ -118,6 +131,30 @@ def build_app(
     @app.get("/health")
     def health():
         return {"ok": True, "device": str(model.device)}
+
+    @app.post("/next_token")
+    def next_token(req: NextTokenRequest) -> NextTokenResponse:
+        t0 = time.time()
+        inputs = tokenizer(req.prompt, return_tensors="pt").to(model.device)
+        input_tokens = inputs.input_ids.shape[1]
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=1,
+                do_sample=True,
+                temperature=req.temperature,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        gen_ids = out[0][input_tokens:]
+        # handle case where generate returns only prompt (shouldn't happen with max_new_tokens=1)
+        if gen_ids.numel() == 0:
+            token_id = int(tokenizer.eos_token_id or 0)
+            token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+        else:
+            token_id = int(gen_ids[-1].item())
+            token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+        wall = int((time.time() - t0) * 1000)
+        return NextTokenResponse(token=token_text, token_id=token_id, input_tokens=input_tokens, output_tokens=1, wall_time_ms=wall)
 
     @app.post("/sign_receipt")
     def sign_receipt(receipt: dict):

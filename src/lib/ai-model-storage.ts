@@ -8,8 +8,12 @@
 import type { AIModel, ModelServeStatus } from '@/types/ai-model';
 
 // In-memory storage (replace with database in production)
-const models = new Map<string, AIModel>();
-const servingStatus = new Map<string, ModelServeStatus>();
+// Use global singletons so data persists across route module reloads and is shared across routes.
+const g = globalThis as any;
+if (!g.__AI_MODELS_STORE__) g.__AI_MODELS_STORE__ = new Map<string, AIModel>();
+if (!g.__AI_SERVE_STATUS__) g.__AI_SERVE_STATUS__ = new Map<string, ModelServeStatus>();
+const models: Map<string, AIModel> = g.__AI_MODELS_STORE__;
+const servingStatus: Map<string, ModelServeStatus> = g.__AI_SERVE_STATUS__;
 
 // Model storage directory
 export const MODEL_STORAGE_DIR = process.env.AI_MODEL_DIR || './models';

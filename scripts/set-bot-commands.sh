@@ -20,14 +20,28 @@ esac
 
 COMMANDS='[
   {"command":"start","description":"Start bot"},
-  {"command":"invoice","description":"Create crypto invoice: /invoice <amount> <asset>"},
+  {"command":"invoice","description":"Create invoice: /invoice <amount> <asset>"},
   {"command":"send","description":"Send crypto: /send <user> <amount> <asset>"},
   {"command":"check","description":"Create voucher: /check <amount> <asset>"},
   {"command":"balance","description":"View wallet balance"},
   {"command":"request","description":"Create payment request (legacy)"},
   {"command":"startparty","description":"Create a party room"},
   {"command":"listparty","description":"List open party rooms"},
-  {"command":"findparty","description":"Search for party rooms by keyword"}
+  {"command":"findparty","description":"Search party rooms by keyword"},
+
+  {"command":"ai","description":"AI menu & downloads"},
+  {"command":"ailist","description":"List downloaded models"},
+  {"command":"aiserve","description":"Start serving a model"},
+  {"command":"aichat","description":"Chat with a specific model"},
+  {"command":"aistop","description":"Stop serving a model"},
+  {"command":"aihelp","description":"AI commands help"},
+  {"command":"aiclear","description":"Clear AI chat session"},
+  {"command":"aisetup","description":"One-click installers"},
+  {"command":"aisetupgpu","description":"Linux CUDA installer"},
+  {"command":"aiseeding","description":"Show swarm seeding status"},
+  {"command":"ask","description":"Ask AI: /ask <msg> #<code>"},
+  {"command":"miner","description":"Miner dashboard"},
+  {"command":"pay","description":"Pay an address: /pay <to> <amt>"}
 ]'
 
 DATA="{\"commands\":$COMMANDS,\"scope\":{\"type\":\"${SCOPE}\"}}"

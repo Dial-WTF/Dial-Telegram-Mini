@@ -17,9 +17,10 @@ import {
   TORRENT_STORAGE_DIR,
 } from './ai-model-storage';
 import { parseHuggingFaceUrl, downloadHFModel } from './ai-huggingface';
-import { downloadModelTorrent, createModelTorrent } from './ai-torrent-manager';
+// Torrent helpers are loaded dynamically to avoid bundling optional deps
 import { mkdir, rm } from 'fs/promises';
 import { join } from 'path';
+import { readdir, stat, readFile, writeFile } from 'fs/promises';
 
 /**
  * Initialize model manager
@@ -32,6 +33,69 @@ export async function initModelManager(): Promise<void> {
   console.log('[Model Manager] Initialized');
   console.log(`[Model Manager] Model storage: ${MODEL_STORAGE_DIR}`);
   console.log(`[Model Manager] Torrent storage: ${TORRENT_STORAGE_DIR}`);
+}
+
+/**
+ * Rescan local models from disk and load into memory store.
+ * Looks for models/<modelId>/model.json first; if missing, infers from files.
+ */
+export async function rescanLocalModelsFromDisk(): Promise<number> {
+  const baseDir = MODEL_STORAGE_DIR;
+  let count = 0;
+  try {
+    const entries = await readdir(baseDir, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const modelId = e.name;
+      try {
+        const metaPath = join(baseDir, modelId, 'model.json');
+        try {
+          const buf = await readFile(metaPath, 'utf8');
+          const data = JSON.parse(buf);
+          saveModel(data);
+          count++;
+          continue;
+        } catch {}
+        // Fallback: guess from files
+        const dirFiles = await readdir(join(baseDir, modelId));
+        const file = dirFiles.find(f => /\.(gguf|safetensors|bin|pt|pth|onnx)$/i.test(f));
+        if (!file) continue;
+        const fp = join(baseDir, modelId, file);
+        const st = await stat(fp);
+        // Heuristic: repoId::fileName from id
+        let repoId = '';
+        let fileName = file;
+        const parts = modelId.split('__');
+        if (parts.length >= 2) {
+          // first part may be repoId with underscores for '/'
+          const first = parts[0];
+          const idx = first.indexOf('_');
+          if (idx > 0) repoId = first.slice(0, idx) + '/' + first.slice(idx + 1).replace(/_/g, '-');
+        }
+        const model: AIModel = {
+          id: modelId,
+          name: repoId || modelId,
+          huggingFaceUrl: '',
+          repoId,
+          fileName,
+          size: st.size,
+          format: (file.endsWith('.gguf') ? 'gguf' : file.endsWith('.onnx') ? 'onnx' : 'pytorch'),
+          status: 'ready',
+          downloadProgress: 100,
+          uploadedBytes: 0,
+          downloadedBytes: st.size,
+          peers: 0,
+          seeders: 0,
+          addedAt: Date.now(),
+          metadata: {},
+          localPath: fp,
+        };
+        saveModel(model);
+        count++;
+      } catch {}
+    }
+  } catch {}
+  return count;
 }
 
 /**
@@ -107,10 +171,22 @@ export async function addModelFromHuggingFace(
     };
     
     saveModel(updatedModel);
+    // Persist metadata for rescan
+    try {
+      const metaPath = join(MODEL_STORAGE_DIR, modelId, 'model.json');
+      await writeFile(metaPath, JSON.stringify(updatedModel, null, 2), 'utf8');
+    } catch {}
+    // Best-effort immediate registry update so peers list reflects new model
+    try {
+      const { registerSelf } = await import('./swarm-client');
+      const base = (process.env.PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+      registerSelf(base).catch(() => {});
+    } catch {}
     
-    // Create torrent for P2P sharing if requested
-    if (options.createTorrent) {
+    // Create torrent for P2P sharing if explicitly enabled
+    if (options.createTorrent && process.env.ENABLE_TORRENTS === '1') {
       try {
+        const { createModelTorrent } = await import('./ai-torrent-manager');
         const { magnetUri, infoHash } = await createModelTorrent(
           modelId,
           filePath,
@@ -119,6 +195,18 @@ export async function addModelFromHuggingFace(
             updatedModel.magnetUri = uri;
             updatedModel.infoHash = hash;
             saveModel(updatedModel);
+            try {
+              const metaPath = join(MODEL_STORAGE_DIR, modelId, 'model.json');
+              // Use promise-based write to avoid 'await' in a non-async callback
+              writeFile(metaPath, JSON.stringify(updatedModel, null, 2), 'utf8').catch(() => {});
+            } catch {}
+            try {
+              // Use dynamic import without await in this non-async callback
+              import('./swarm-client').then(({ registerSelf }) => {
+                const base = (process.env.PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+                registerSelf(base).catch(() => {});
+              }).catch(() => {});
+            } catch {}
           }
         );
         
@@ -187,6 +275,7 @@ export async function addModelFromMagnet(
     const downloadPath = join(MODEL_STORAGE_DIR, modelId);
     await mkdir(downloadPath, { recursive: true });
     
+    const { downloadModelTorrent } = await import('./ai-torrent-manager');
     const filePath = await downloadModelTorrent(
       modelId,
       magnetUri,
