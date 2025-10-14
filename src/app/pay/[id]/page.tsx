@@ -56,7 +56,7 @@ export default function PayPage() {
         {mounted ? (
           <>
             <img src={qr} alt="QR" className="mx-auto my-4 rounded-xl" />
-            <a className="block text-center underline" href={ethUri ? `/paylink?uri=${encodeURIComponent(ethUri)}` : deepLink}>
+            <a className="block text-center underline" href={ethUri ? `/paylink?uri=${encodeURIComponent(ethUri)}` : deepLink} rel="noopener noreferrer">
               Open payment link
             </a>
           </>
