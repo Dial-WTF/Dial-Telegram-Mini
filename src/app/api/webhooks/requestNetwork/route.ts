@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { tg } from '#/lib/telegram';
 import { requestContextById } from '#/lib/mem';
+import { s3 } from '#/services/s3/client';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { PATH_INVOICES } from '#/services/s3/filepaths';
+import { AWS_S3_BUCKET } from '#/config/constants';
 
 export const runtime = 'nodejs';
 
@@ -96,6 +100,13 @@ export async function POST(req: NextRequest) {
       // Clear context after success to avoid leaks
       try { if (requestId) requestContextById.delete(requestId); } catch {}
     }
+
+    // Persist webhook payload for durability
+    try {
+      const key = `${PATH_INVOICES}pending/request-${(requestId || 'unknown')}-${Date.now()}.json`;
+      const payload = Buffer.from(JSON.stringify(body, null, 2));
+      await s3.send(new PutObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key, Body: payload, ContentType: 'application/json' }));
+    } catch {}
 
     return NextResponse.json({ ok: true, received: true, event: eventType, requestId });
   } catch (e: any) {

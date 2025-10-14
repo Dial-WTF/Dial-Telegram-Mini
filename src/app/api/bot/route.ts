@@ -5,20 +5,36 @@ import { parseRequest } from '#/lib/parse';
 import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '#/lib/addr';
 import { tg } from '#/lib/telegram';
 import { fetchPayCalldata, extractForwarderInputs } from '#/lib/requestApi';
+import { createAddressActivityWebhook, updateWebhookAddresses } from '#/lib/alchemyWebhooks';
 import { bpsToPercentString } from '#/lib/fees';
 import { buildEthereumUri, decodeProxyDataAndValidateValue } from '#/lib/ethUri';
-import { buildPredictTenderlyInput, predictDestinationTenderly, createIncomingPaymentAlert } from '#/lib/tenderlyApi';
+import { formatCaptionRich } from '#/lib/format';
+import { getEthUsdPrice } from '#/lib/prices';
+import { buildForwarderInitCode, predictCreate2AddressCreateX } from '#/lib/create2x';
 import ForwarderArtifact from '#/lib/contracts/DepositForwarderMinimal/DepositForwarderMinimal.json';
 import { keccak256, toHex } from 'viem';
 import { estimateGasAndPrice } from '#/lib/gas';
 import { buildQrForRequest } from '#/lib/qrUi';
 import { isValidEthereumAddress } from '#/lib/utils';
 import { requestContextById, predictContextByAddress, requestIdByPredictedAddress } from '#/lib/mem';
-// S3 disabled to avoid optional dependency issues at build time
-const S3_DISABLED = true as const;
-// Optional dependency stubs
-async function loadS3() { return null as any; }
+// Optional dependency: Privy disabled in this build
 async function getPrivyClient() { return null as any; }
+// Enable S3 writes using our internal client util
+async function loadS3() {
+  try {
+    const { s3 } = await import('#/services/s3');
+    const { PutObjectCommand } = await import('@aws-sdk/client-s3');
+    const { PATH_INVOICES } = await import('#/services/s3/filepaths');
+    const { AWS_S3_BUCKET } = await import('#/config/constants');
+    async function writeS3File(key: string, opts: { Body: Buffer; ContentType: string }) {
+      await s3.send(new PutObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key, ...opts }));
+      return true;
+    }
+    return { s3, PutObjectCommand, PATH_INVOICES, AWS_S3_BUCKET, writeS3File } as const;
+  } catch {
+    return null as any;
+  }
+}
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
 const pendingAddressByUser = new Map<number, { amount: number; note: string }>();
@@ -1704,6 +1720,8 @@ export async function POST(req: NextRequest) {
 
         // Build QR using forwarder prediction (Create2) for improved wallet compatibility
         let ethUri: string | undefined;
+        let lastEthWei: bigint | undefined = undefined;
+        let lastNetworkId: string = '1';
         let savedInvoiceIndexKey: string | undefined;
         try {
           const feeAddress = process.env.FEE_ADDRESS || appConfig.feeAddr || undefined;
@@ -1717,28 +1735,24 @@ export async function POST(req: NextRequest) {
           // Compute network id and CreateX config
           const chainKey = String(appConfig.request.chain || '').toLowerCase();
           const NETWORK_ID_BY_CHAIN: Record<string, string> = { base: '8453', ethereum: '1', mainnet: '1', sepolia: '11155111' };
-          const networkId = process.env.TENDERLY_NETWORK_ID || NETWORK_ID_BY_CHAIN[chainKey] || '1';
+          const networkId = NETWORK_ID_BY_CHAIN[chainKey] || '1';
+          lastNetworkId = networkId;
+          lastEthWei = (typeof fwd.amountWei === 'bigint' ? fwd.amountWei : undefined);
           const createx = (process.env.CREATEX_ADDRESS || process.env.CREATE_X || '').trim() as `0x${string}`;
-          const from = (process.env.TENDERLY_FROM || process.env.CREATEX_FROM || '').trim() as `0x${string}`;
           if (!/^0x[0-9a-fA-F]{40}$/.test(createx)) throw new Error('Missing CREATEX_ADDRESS');
-          if (!/^0x[0-9a-fA-F]{40}$/.test(from)) throw new Error('Missing TENDERLY_FROM');
 
           // Salt ties deposit address to request id and chain
           const salt = keccak256(toHex(`DIAL|${id}|${networkId}`)) as `0x${string}`;
-          const predictInput = buildPredictTenderlyInput({
-            networkId,
-            createx,
-            from,
+          const initCode = buildForwarderInitCode({
             requestProxy: fwd.requestProxy,
             beneficiary: fwd.beneficiary,
             paymentReferenceHex: fwd.paymentReferenceHex,
             feeAmountWei: fwd.feeAmountWei,
             feeAddress: fwd.feeAddress,
-            salt,
-            artifact: { bytecode: (ForwarderArtifact as any)?.bytecode as `0x${string}` },
+            bytecode: (ForwarderArtifact as any)?.bytecode as `0x${string}`,
           });
-          if (DEBUG) { try { console.log('[BOT]/request predict input:', { networkId, createx, from, salt: predictInput.salt.slice(0,10)+'…', initCodeLen: predictInput.initCode.length }); } catch {} }
-          const { predicted } = await predictDestinationTenderly(predictInput);
+          if (DEBUG) { try { console.log('[BOT]/request predict input:', { networkId, createx, salt: salt.slice(0,10)+'…', initCodeLen: initCode.length }); } catch {} }
+          const predicted = predictCreate2AddressCreateX({ deployer: createx, rawSalt: salt, initCode });
           if (DEBUG) { try { console.log('[BOT]/request predicted address:', predicted); } catch {} }
           if (predicted && fwd.amountWei && fwd.amountWei > 0n) {
             const decVal = fwd.amountWei.toString(10);
@@ -1747,9 +1761,8 @@ export async function POST(req: NextRequest) {
               predictContextByAddress.set(String(predicted).toLowerCase(), {
                 networkId,
                 createx,
-                salt: predictInput.salt,
-                initCode: predictInput.initCode,
-                from,
+                salt,
+                initCode,
               });
               requestIdByPredictedAddress.set(String(predicted).toLowerCase(), id);
             } catch {}
@@ -1773,8 +1786,8 @@ export async function POST(req: NextRequest) {
                 requestId: id,
                 networkId,
                 predictedAddress: String(predicted),
-                salt: predictInput.salt,
-                initCode: predictInput.initCode,
+                salt,
+                initCode,
                 requestProxy: fwd.requestProxy,
                 beneficiary: fwd.beneficiary,
                 paymentReferenceHex: fwd.paymentReferenceHex,
@@ -1804,7 +1817,23 @@ export async function POST(req: NextRequest) {
               if (DEBUG) { try { console.warn('[BOT]/request failed to save invoice S3:', (e as any)?.message || e); } catch {} }
             }
             // Optional: Alchemy webhook integration removed (no-op if not configured)
-            try { /* noop */ } catch {}
+              // Register address activity on Alchemy webhook (create once, then update addresses)
+              try {
+                const alchemyWebhookId = process.env.ALCHEMY_WEBHOOK_ID;
+                if (alchemyWebhookId) {
+                  await updateWebhookAddresses({ webhookId: alchemyWebhookId, add: [predicted as `0x${string}`], remove: [] });
+                  if (DEBUG) {
+                    try { console.log('[BOT]/request alchemy: added address to webhook', { webhookId: alchemyWebhookId, address: predicted }); } catch {}
+                  }
+                } else {
+                  const created = await createAddressActivityWebhook({ addresses: [predicted as `0x${string}`] });
+                  if (DEBUG) {
+                    try { console.log('[BOT]/request alchemy: created webhook', created); } catch {}
+                  }
+                }
+              } catch (e) {
+                if (DEBUG) { try { console.warn('[BOT] alchemy webhook setup failed', { error: (e as any)?.message || e }); } catch {} }
+              }
             // Action registration temporarily disabled; focusing on alert only
 
             // Build direct ETH URI to pay predicted deposit address
@@ -1816,7 +1845,23 @@ export async function POST(req: NextRequest) {
           if (DEBUG) { try { console.warn('[BOT] forwarder predict failed; fallback to invoice link', (e as any)?.message || e); } catch {} }
         }
         const { qrUrl, caption, keyboard, payUrl: builtPayUrl } = buildQrForRequest(baseUrl, id, ethUri, amt, note || '');
-        const sent = await tg.sendPhoto(chatId, qrUrl, caption, keyboard);
+        // Convert request amount to USD via price API
+        let usdAmount = amt;
+        try {
+          const px = await getEthUsdPrice();
+          if (px && typeof lastEthWei === 'bigint') {
+            const ethFloat = Number(lastEthWei) / 1e18;
+            usdAmount = ethFloat * px;
+          }
+        } catch {}
+        // Build rich caption with USD and ETH pretty amounts
+        const netName = (lastNetworkId === '1' ? 'mainnet' : lastNetworkId === '8453' ? 'base' : lastNetworkId === '11155111' ? 'sepolia' : lastNetworkId);
+        const richCaption = (() => {
+          try {
+            return formatCaptionRich({ username: (msg?.from?.username || '').toString() || undefined, usdAmount, ethWei: lastEthWei, networkName: netName, note: note || '' });
+          } catch { return caption; }
+        })();
+        const sent = await tg.sendPhoto(chatId, qrUrl, richCaption, keyboard);
         const messageId = sent?.result?.message_id as number | undefined;
         if (messageId) {
           try {

@@ -40,7 +40,7 @@ export const appConfig: AppConfig = {
     apiKey: env("REQUEST_API_KEY"),
     restBase: env("REQUEST_REST_BASE", "https://api.request.network/v1")!,
     nodeUrl: env("REQUEST_NODE_URL", "https://main.gateway.request.network")!,
-    chain: (env("REQUEST_CHAIN", "base") || "base").toLowerCase(),
+    chain: (env("REQUEST_CHAIN", "ethereum") || "ethereum").toLowerCase(),
     erc20Address: env("ERC20_TOKEN_ADDRESS"),
     defaultBaseUSDC: DEFAULT_BASE_USDC,
   },

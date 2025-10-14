@@ -8,6 +8,7 @@ import BottomNav from "#/components/BottomNav";
 export default function PayPage() {
   const [status, setStatus] = useState<"pending" | "paid" | "error">("pending");
   const [balance, setBalance] = useState<string>("0");
+  const [ethUri, setEthUri] = useState<string>("");
   const [mounted, setMounted] = useState(false);
   const routeParams = useParams<{ id: string }>();
   const id = (routeParams?.id as string) || "";
@@ -25,6 +26,7 @@ export default function PayPage() {
         }
         setStatus(r.status);
         setBalance(r.balance?.balance ?? "0");
+        if (typeof r.ethereumUri === 'string') setEthUri(r.ethereumUri);
       } catch {
         setStatus("error");
       }
@@ -39,10 +41,9 @@ export default function PayPage() {
   const deepLink = mounted && id
     ? `${window.location.origin}/pay/${id}`
     : "";
+  const qrPayload = ethUri || deepLink;
   const qr = mounted
-    ? `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
-        deepLink
-      )}`
+    ? `${window.location.origin}/api/qr?size=720&data=${encodeURIComponent(qrPayload)}&logo=/phone-logo-no-bg.png&footerH=180&wordmark=/Dial.letters.transparent.bg.crop.png`
     : "";
 
   return (
@@ -55,7 +56,7 @@ export default function PayPage() {
         {mounted ? (
           <>
             <img src={qr} alt="QR" className="mx-auto my-4 rounded-xl" />
-            <a className="block text-center underline" href={deepLink} target="_blank">
+            <a className="block text-center underline" href={ethUri ? `/paylink?uri=${encodeURIComponent(ethUri)}` : deepLink}>
               Open payment link
             </a>
           </>

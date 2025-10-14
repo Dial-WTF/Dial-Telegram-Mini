@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { RequestNetwork } from "@requestnetwork/request-client.js";
+import { s3 } from "#/services/s3/client";
+import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { PATH_INVOICES } from "#/services/s3/filepaths";
+import { AWS_S3_BUCKET } from "#/config/constants";
 import { appConfig } from "#/lib/config";
 export const runtime = 'nodejs';
 
@@ -31,7 +35,20 @@ export async function GET(req: NextRequest) {
       }
       if (data) {
         const paid = !!data?.hasBeenPaid;
-        return NextResponse.json({ status: paid ? 'paid' : 'pending', balance: paid ? { balance: '1' } : { balance: '0' } });
+        // try to attach ethereumUri from S3 index
+        let ethereumUri: string | undefined;
+        try {
+          const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
+          const obj = await s3.send(new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: idxKey }));
+          const txt = await (obj.Body as any).transformToString();
+          const rec = JSON.parse(txt || '{}');
+          // fetch full invoice file to read uri
+          if (rec?.requestId) {
+            const prefix = `${PATH_INVOICES}invoice-`;
+            // we don't know the predicted address here; attempt a best-effort find by S3 list is heavy; skip
+          }
+        } catch {}
+        return NextResponse.json({ status: paid ? 'paid' : 'pending', balance: paid ? { balance: '1' } : { balance: '0' }, ethereumUri });
       }
       // Fallback to SDK if REST paths fail
       try {
