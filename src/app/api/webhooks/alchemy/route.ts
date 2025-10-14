@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { createHmac } from 'crypto';
 import { deployedCreate2Salts, predictContextByAddress, requestContextById, requestIdByPredictedAddress } from '#/lib/mem';
 import { tg } from '#/lib/telegram';
 import { s3 } from '#/services/s3/client';
@@ -20,14 +21,27 @@ const CREATEX_ABI = [
 export async function POST(req: NextRequest) {
   try {
     const DEBUG = process.env.DEBUG_BOT === '1';
-    // Optional: verify Alchemy signature if configured later
-    const secret = process.env.WEBHOOK_SECRET || '';
-    const auth = req.headers.get('x-webhook-secret') || '';
-    if (secret && auth !== secret) {
-      return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+    // Verify signature if ALCHEMY_SIGNATURE is set; else fall back to x-webhook-secret check
+    const signingKey = process.env.ALCHEMY_SIGNATURE as string | undefined;
+    const rawBody = await req.text().catch(() => '');
+    if (signingKey) {
+      const received = (req.headers.get('x-alchemy-signature') || '').toString();
+      const expected = createHmac('sha256', signingKey).update(rawBody).digest('hex');
+      const match = received === expected || received.replace(/^sha256=/i, '') === expected;
+      if (!match) {
+        if (DEBUG) { try { console.warn('[WEBHOOK][Alchemy] signature mismatch', { received: received.slice(0, 12) + '…', expected: expected.slice(0, 12) + '…' }); } catch {} }
+        return NextResponse.json({ ok: false, error: 'invalid_signature' }, { status: 401 });
+      }
+    } else {
+      const secret = process.env.WEBHOOK_SECRET || '';
+      const auth = req.headers.get('x-webhook-secret') || '';
+      if (secret && auth !== secret) {
+        if (DEBUG) { try { console.log('[WEBHOOK][Alchemy] unauthorized (missing/invalid x-webhook-secret)'); } catch {} }
+        return NextResponse.json({ ok: false, error: 'unauthorized' }, { status: 401 });
+      }
     }
 
-    const body = await req.json().catch(() => ({} as any));
+    const body = rawBody ? (JSON.parse(rawBody || '{}') as any) : ({} as any);
     if (DEBUG) {
       try {
         const sample = JSON.stringify(body).slice(0, 500);
@@ -35,9 +49,17 @@ export async function POST(req: NextRequest) {
         console.log('[WEBHOOK][Alchemy] headers=', Object.fromEntries(req.headers));
       } catch {}
     }
-    // Address Activity webhook: expect affected address in payload
-    // See Alchemy docs for exact shape; we support a few common fields
-    const addr = (body?.event?.activity?.[0]?.toAddress || body?.event?.activity?.[0]?.to || body?.address || body?.to || '').toLowerCase();
+    // Address Activity webhook: try to resolve the predicted deposit address from payload
+    // Some events include internal calls where toAddress is the proxy; in that case, the deposit
+    // is usually the fromAddress. Prefer a mapped address from our context set.
+    const acts: any[] = Array.isArray(body?.event?.activity) ? body.event.activity : [];
+    const first = acts[0] || {};
+    const candidates: string[] = [
+      (first?.toAddress || first?.to || '').toString().toLowerCase(),
+      (first?.fromAddress || '').toString().toLowerCase(),
+      (body?.address || body?.to || '').toString().toLowerCase(),
+    ].filter(Boolean);
+    let addr = candidates.find((a) => predictContextByAddress.has(a)) || candidates[0] || '';
     if (!addr || !/^0x[0-9a-fA-F]{40}$/.test(addr)) {
       if (DEBUG) { try { console.warn('[WEBHOOK][Alchemy] invalid address in payload'); } catch {} }
       return NextResponse.json({ ok: false, reason: 'invalid_address' }, { status: 200 });
@@ -120,29 +142,10 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, skipped: true, reason: 'deploy_failed' });
     }
 
-    // Try to update the original message status to Pending (🟡)
+    // Compute inbound total received by the deposit address (exclude internal forwards to proxy)
+    // and update UI to Processing/Partial/Pending based on threshold vs inbound
+    let inboundTotal = 0n;
     try {
-      const reqId = requestIdByPredictedAddress.get(addr) || (body?.requestId || body?.event?.requestId || '').toString();
-      const maybeCtx = reqId ? requestContextById.get(reqId) : undefined;
-      if (maybeCtx?.chatId && maybeCtx?.messageId) {
-        // Rebuild keyboard to ensure button changes
-        const base = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const openUrl = `${base}/pay/${reqId}`;
-        const scanUrl = `https://scan.request.network/request/${reqId}`;
-        const kb = { inline_keyboard: [
-          [{ text: 'Open invoice', url: openUrl }],
-          [{ text: 'View on Request Scan', url: scanUrl }],
-          [{ text: 'Status: 🟡 Pending', callback_data: 'sr' }],
-        ] } as any;
-        await tg.editReplyMarkup(maybeCtx.chatId, maybeCtx.messageId, kb);
-        await tg.editCaption(maybeCtx.chatId, maybeCtx.messageId, 'Request: 🟡 Pending', kb);
-      }
-    } catch {}
-
-    // If paid enough, remove address from webhook to reduce noise
-    try {
-      const acts: any[] = Array.isArray(body?.event?.activity) ? body.event.activity : [];
-      let inboundTotal = 0n;
       for (const a of acts) {
         const toA = (a?.toAddress || a?.to || '').toString().toLowerCase();
         if (toA === addr) {
@@ -157,7 +160,47 @@ export async function POST(req: NextRequest) {
           if (wei && wei > 0n) inboundTotal += wei;
         }
       }
-      const threshold = invoiceRec?.amountWei ? BigInt(String(invoiceRec.amountWei)) : 0n;
+    } catch {}
+
+    const threshold = invoiceRec?.amountWei ? BigInt(String(invoiceRec.amountWei)) : 0n;
+
+    // Try to update the original message status to Pending/Processing
+    try {
+      const reqId = requestIdByPredictedAddress.get(addr) || (body?.requestId || body?.event?.requestId || '').toString();
+      const maybeCtx = reqId ? requestContextById.get(reqId) : undefined;
+      if (maybeCtx?.chatId && maybeCtx?.messageId) {
+        // Rebuild keyboard to ensure button changes
+        const base = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const openUrl = `${base}/pay/${reqId}`;
+        const scanUrl = `https://scan.request.network/request/${reqId}`;
+        const statusText = threshold > 0n
+          ? (inboundTotal === 0n ? 'Status: 🟡 Pending'
+             : (inboundTotal < threshold ? 'Status: 🟠 Processing (partial)'
+               : 'Status: 🟡 Pending'))
+          : 'Status: 🟡 Pending';
+        const kb = { inline_keyboard: [
+          [{ text: 'Open invoice', url: openUrl }],
+          [{ text: 'View on Request Scan', url: scanUrl }],
+          [{ text: statusText, callback_data: 'sr' }],
+        ] } as any;
+        await tg.editReplyMarkup(maybeCtx.chatId, maybeCtx.messageId, kb);
+        const caption = inboundTotal > 0n
+          ? `Request: 🟠 Processing${threshold > 0n ? ` — ${inboundTotal.toString()} / ${threshold.toString()} wei` : ''}`
+          : 'Request: 🟡 Pending';
+        await tg.editCaption(maybeCtx.chatId, maybeCtx.messageId, caption, kb);
+      }
+    } catch {}
+
+    // Persist raw webhook to S3 pending folder for diagnosis and recovery
+    try {
+      const reqId = requestIdByPredictedAddress.get(addr) || (body?.requestId || body?.event?.requestId || '').toString();
+      const key = `${PATH_INVOICES}pending/${addr}-${Date.now()}.json`;
+      const payload = Buffer.from(JSON.stringify({ requestId: reqId, addr, inboundTotal: inboundTotal.toString(), threshold: threshold.toString(), body }, null, 2));
+      await s3.send(new PutObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key, Body: payload, ContentType: 'application/json' }));
+    } catch {}
+
+    // If paid enough, remove address from webhook to reduce noise
+    try {
       if (threshold > 0n && inboundTotal >= threshold) {
         const webhookId = process.env.ALCHEMY_WEBHOOK_ID as string | undefined;
         if (webhookId) {
