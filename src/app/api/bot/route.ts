@@ -18,8 +18,7 @@ import {
   buildEthereumUri,
   decodeProxyDataAndValidateValue,
 } from "#/lib/ethUri";
-import { formatCaptionRich } from "#/lib/format";
-import { getEthUsdPrice } from "#/lib/prices";
+import { formatCaptionRich, formatEthTrimmed } from "#/lib/format";
 import {
   buildForwarderInitCode,
   predictCreate2AddressCreateX,
@@ -67,9 +66,10 @@ async function loadS3() {
 }
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
+// Stores ETH amounts (not USD)
 const pendingAddressByUser = new Map<
   number,
-  { amount: number; note: string }
+  { ethAmount: number; note: string }
 >();
 
 async function resolveEnsOrAddress(input: string): Promise<string | undefined> {
@@ -1231,7 +1231,7 @@ export async function POST(req: NextRequest) {
           },
           body: JSON.stringify({
             payee: addr,
-            amount: Number(ctx.amount),
+            amount: Number(ctx.ethAmount),
             note: ctx.note || "",
             kind: "request",
             initData: "",
@@ -1254,7 +1254,7 @@ export async function POST(req: NextRequest) {
         } as any;
         await tg.sendMessage(
           chatId,
-          `Request: $${ctx.amount.toFixed(2)}${
+          `Request: ${formatEthTrimmed(BigInt(Math.round(ctx.ethAmount * 1e18)))} ETH${
             ctx.note ? ` — ${ctx.note}` : ""
           }`
         );
@@ -2373,7 +2373,9 @@ export async function POST(req: NextRequest) {
         if (DEBUG) {
           await reply(`dbg: parse failed. raw="${text}"`);
         }
-        await reply("Usage: /request <amount> [note] [destination]");
+        await reply(
+          "Usage: /request <eth_amount> [note] [destination]\n\nExample: /request 0.1 coffee vitalik.eth"
+        );
         return NextResponse.json({ ok: true });
       }
 
@@ -2424,7 +2426,7 @@ export async function POST(req: NextRequest) {
               [{ text: "Open app to link wallet", web_app: { url: baseUrl } }],
             ],
           } as any;
-          pendingAddressByUser.set(tgUserId, { amount: amt, note });
+          pendingAddressByUser.set(tgUserId, { ethAmount: amt, note });
           const combinedText =
             "No wallet linked. Open the app and sign in first, then retry /request.\n\nAlternatively, reply to this message with your receiving address or ENS.";
           await tgCall("sendMessage", {
@@ -2752,22 +2754,16 @@ export async function POST(req: NextRequest) {
             } catch {}
           }
         }
+        // Build QR with ETH amount
+        const ethWei = lastEthWei || BigInt(Math.round(amt * 1e18));
         const {
           qrUrl,
           caption,
           keyboard,
           payUrl: builtPayUrl,
-        } = buildQrForRequest(baseUrl, id, ethUri, amt, note || "");
-        // Convert request amount to USD via price API
-        let usdAmount = amt;
-        try {
-          const px = await getEthUsdPrice();
-          if (px && typeof lastEthWei === "bigint") {
-            const ethFloat = Number(lastEthWei) / 1e18;
-            usdAmount = ethFloat * px;
-          }
-        } catch {}
-        // Build rich caption with USD and ETH pretty amounts
+        } = buildQrForRequest(baseUrl, id, ethUri, ethWei, note || "");
+
+        // Build rich caption with ETH amount and network
         const netName =
           lastNetworkId === "1"
             ? "mainnet"
@@ -2780,8 +2776,7 @@ export async function POST(req: NextRequest) {
           try {
             return formatCaptionRich({
               username: (msg?.from?.username || "").toString() || undefined,
-              usdAmount,
-              ethWei: lastEthWei,
+              ethWei,
               networkName: netName,
               note: note || "",
             });
@@ -2796,7 +2791,7 @@ export async function POST(req: NextRequest) {
             requestContextById.set(id, {
               chatId: Number(chatId),
               messageId: Number(messageId),
-              paidCaption: `✅ PAID — $${amt.toFixed(2)}${
+              paidCaption: `✅ PAID — ${formatEthTrimmed(ethWei)} ETH${
                 note ? ` — ${note}` : ""
               }`,
               replyMarkup: keyboard,
