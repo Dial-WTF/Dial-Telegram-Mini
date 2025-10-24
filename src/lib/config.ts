@@ -12,9 +12,7 @@ export type AppConfig = {
     apiKey?: string;
     restBase: string;
     nodeUrl: string;
-    chain: string; // e.g., "base"
-    erc20Address?: string; // if set, use addr; else defaultBaseUSDC
-    defaultBaseUSDC: string;
+    chain: string; // e.g., "ethereum", "base"
   };
   getPayUrl: (id: string) => string;
 };
@@ -24,8 +22,6 @@ function env(name: string, fallback?: string): string | undefined {
   if (v === undefined || v === null || v === "") return fallback;
   return v;
 }
-
-const DEFAULT_BASE_USDC = "0x833589fCD6EDb6E08f4c7C32D4f71b54bdA02913";
 
 export const appConfig: AppConfig = {
   isProd: process.env.NODE_ENV === "production",
@@ -41,8 +37,6 @@ export const appConfig: AppConfig = {
     restBase: env("REQUEST_REST_BASE", "https://api.request.network/v1")!,
     nodeUrl: env("REQUEST_NODE_URL", "https://main.gateway.request.network")!,
     chain: (env("REQUEST_CHAIN", "ethereum") || "ethereum").toLowerCase(),
-    erc20Address: env("ERC20_TOKEN_ADDRESS"),
-    defaultBaseUSDC: DEFAULT_BASE_USDC,
   },
   getPayUrl: (id: string) => {
     const base = env("PUBLIC_BASE_URL", "")!;

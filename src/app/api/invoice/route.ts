@@ -113,19 +113,17 @@ export async function POST(req: NextRequest) {
 
     // Configuration via env
     const chain = appConfig.request.chain;
-    const erc20Address = (appConfig.request.erc20Address || "").trim();
-    const currencyValue = erc20Address !== "" ? erc20Address : appConfig.request.defaultBaseUSDC;
-
-    // USDC default decimals (6). If you change token, adjust decimals accordingly.
-    const expectedAmount = BigInt(Math.round(amt * 1e6)).toString();
+    
+    // Native ETH with 18 decimals
+    const expectedAmount = BigInt(Math.round(amt * 1e18)).toString();
 
     if (DEBUG_REQ) {
       try {
         console.log('[REQ][SDK] config', {
           chain: appConfig.request.chain,
           nodeUrl: appConfig.request.nodeUrl,
-          currency: appConfig.request.erc20Address || appConfig.request.defaultBaseUSDC,
-          expectedAmount: BigInt(Math.round(amt * 1e6)).toString(),
+          currency: 'ETH',
+          expectedAmount: BigInt(Math.round(amt * 1e18)).toString(),
           payee: resolvedPayee,
         });
       } catch {}
@@ -134,8 +132,8 @@ export async function POST(req: NextRequest) {
     const created = await client.createRequest({
       requestInfo: {
         currency: {
-          type: Types.RequestLogic.CURRENCY.ERC20,
-          value: currencyValue,
+          type: Types.RequestLogic.CURRENCY.ETH,
+          value: 'ETH',
           network: chain as any,
         },
         expectedAmount,
@@ -151,9 +149,9 @@ export async function POST(req: NextRequest) {
         value: resolvedPayee!,
       },
       contentData: { note, kind, brand: "Dial" },
-      // Use non-fee ERC20 proxy for now; later we can enable fee routes
+      // Use native ETH payment network
       paymentNetwork: {
-        id: Types.Extension.PAYMENT_NETWORK_ID.ERC20_PROXY_CONTRACT,
+        id: Types.Extension.PAYMENT_NETWORK_ID.ETH_INPUT_DATA,
         parameters: {
           paymentNetworkName: chain as any,
           paymentAddress: resolvedPayee!,
