@@ -1,70 +1,114 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { appConfig } from '#/lib/config';
-import { parseEther, Interface } from 'ethers';
-import { parseRequest } from '#/lib/parse';
-import { isValidHexAddress, normalizeHexAddress, resolveEnsToHex } from '#/lib/addr';
-import { tg } from '#/lib/telegram';
-import { fetchPayCalldata, extractForwarderInputs } from '#/lib/requestApi';
-import { createAddressActivityWebhook, updateWebhookAddresses } from '#/lib/alchemyWebhooks';
-import { bpsToPercentString } from '#/lib/fees';
-import { buildEthereumUri, decodeProxyDataAndValidateValue } from '#/lib/ethUri';
-import { formatCaptionRich } from '#/lib/format';
-import { getEthUsdPrice } from '#/lib/prices';
-import { buildForwarderInitCode, predictCreate2AddressCreateX } from '#/lib/create2x';
-import ForwarderArtifact from '#/lib/contracts/DepositForwarderMinimal/DepositForwarderMinimal.json';
-import { keccak256, toHex } from 'viem';
-import { estimateGasAndPrice } from '#/lib/gas';
-import { buildQrForRequest } from '#/lib/qrUi';
-import { isValidEthereumAddress } from '#/lib/utils';
-import { requestContextById, predictContextByAddress, requestIdByPredictedAddress } from '#/lib/mem';
+import { NextRequest, NextResponse } from "next/server";
+import { appConfig } from "#/lib/config";
+import { parseEther, Interface } from "ethers";
+import { parseRequest } from "#/lib/parse";
+import {
+  isValidHexAddress,
+  normalizeHexAddress,
+  resolveEnsToHex,
+} from "#/lib/addr";
+import { tg } from "#/lib/telegram";
+import { fetchPayCalldata, extractForwarderInputs } from "#/lib/requestApi";
+import {
+  createAddressActivityWebhook,
+  updateWebhookAddresses,
+} from "#/lib/alchemyWebhooks";
+import { bpsToPercentString } from "#/lib/fees";
+import {
+  buildEthereumUri,
+  decodeProxyDataAndValidateValue,
+} from "#/lib/ethUri";
+import { formatCaptionRich } from "#/lib/format";
+import { getEthUsdPrice } from "#/lib/prices";
+import {
+  buildForwarderInitCode,
+  predictCreate2AddressCreateX,
+} from "#/lib/create2x";
+import ForwarderArtifact from "#/lib/contracts/DepositForwarderMinimal/DepositForwarderMinimal.json";
+import { keccak256, toHex } from "viem";
+import { estimateGasAndPrice } from "#/lib/gas";
+import { buildQrForRequest } from "#/lib/qrUi";
+import { isValidEthereumAddress } from "#/lib/utils";
+import {
+  requestContextById,
+  predictContextByAddress,
+  requestIdByPredictedAddress,
+} from "#/lib/mem";
 // Optional dependency: Privy disabled in this build
-async function getPrivyClient() { return null as any; }
+async function getPrivyClient() {
+  return null as any;
+}
 // Enable S3 writes using our internal client util
 async function loadS3() {
   try {
-    const { s3 } = await import('#/services/s3');
-    const { PutObjectCommand } = await import('@aws-sdk/client-s3');
-    const { PATH_INVOICES } = await import('#/services/s3/filepaths');
-    const { AWS_S3_BUCKET } = await import('#/config/constants');
-    async function writeS3File(key: string, opts: { Body: Buffer; ContentType: string }) {
-      await s3.send(new PutObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key, ...opts }));
+    const { s3 } = await import("#/services/s3");
+    const { PutObjectCommand } = await import("@aws-sdk/client-s3");
+    const { PATH_INVOICES } = await import("#/services/s3/filepaths");
+    const { AWS_S3_BUCKET } = await import("#/config/constants");
+    async function writeS3File(
+      key: string,
+      opts: { Body: Buffer; ContentType: string }
+    ) {
+      await s3.send(
+        new PutObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key, ...opts })
+      );
       return true;
     }
-    return { s3, PutObjectCommand, PATH_INVOICES, AWS_S3_BUCKET, writeS3File } as const;
+    return {
+      s3,
+      PutObjectCommand,
+      PATH_INVOICES,
+      AWS_S3_BUCKET,
+      writeS3File,
+    } as const;
   } catch {
     return null as any;
   }
 }
 
 // Ephemeral, in-memory state for DM follow-ups (resets on deploy/restart)
-const pendingAddressByUser = new Map<number, { amount: number; note: string }>();
+const pendingAddressByUser = new Map<
+  number,
+  { amount: number; note: string }
+>();
 
 async function resolveEnsOrAddress(input: string): Promise<string | undefined> {
   return resolveEnsToHex(input, process.env.RPC_URL);
 }
 
-export const runtime = 'nodejs';
+export const runtime = "nodejs";
 
-const DEBUG = process.env.DEBUG_BOT === '1';
-const DRY = process.env.BOT_DRY_RUN === '1';
+const DEBUG = process.env.DEBUG_BOT === "1";
+const DRY = process.env.BOT_DRY_RUN === "1";
 
 async function tgCall(method: string, payload: any): Promise<any> {
   if (DRY) {
-    try { console.log(`[BOT_DRY_RUN] ${method}`, payload); } catch {}
+    try {
+      console.log(`[BOT_DRY_RUN] ${method}`, payload);
+    } catch {}
     return { ok: true, result: { message_id: 1 } } as any;
   }
-  const res = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-  });
+  const res = await fetch(
+    `https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }
+  );
   try {
     const json = await res.json();
     if (DEBUG) {
-      try { console.log(`[TG] ${method} ->`, json); } catch {}
+      try {
+        console.log(`[TG] ${method} ->`, json);
+      } catch {}
     }
     return json;
   } catch {
     if (DEBUG) {
-      try { console.log(`[TG] ${method} http=${res.status} ok=${res.ok}`); } catch {}
+      try {
+        console.log(`[TG] ${method} http=${res.status} ok=${res.ok}`);
+      } catch {}
     }
     return { ok: res.ok };
   }
@@ -86,27 +130,39 @@ export async function POST(req: NextRequest) {
     // Swarm heartbeat: periodically register this node and its models
     try {
       const serverBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-      const { ensureSwarmHeartbeat } = await import('@/lib/swarm-init');
+      const { ensureSwarmHeartbeat } = await import("@/lib/swarm-init");
       ensureSwarmHeartbeat(serverBase);
     } catch {}
     // Handle callback queries for status refresh
     const callback = body?.callback_query;
-    if (callback && callback.id && callback.message && typeof callback.data === 'string') {
+    if (
+      callback &&
+      callback.id &&
+      callback.message &&
+      typeof callback.data === "string"
+    ) {
       const chatIdCb = callback.message.chat?.id;
       const messageIdCb = callback.message.message_id;
       const data = callback.data as string;
       // Data may be very short; derive reqId from original message entities/URLs
-      if (data === 'sr' && chatIdCb && messageIdCb) {
+      if (data === "sr" && chatIdCb && messageIdCb) {
         // Derive requestId from message content
-        let reqId = '';
+        let reqId = "";
         try {
-          const entities = (callback.message as any).caption_entities || callback.message.entities || [];
-          const text: string = callback.message.caption || callback.message.text || '';
+          const entities =
+            (callback.message as any).caption_entities ||
+            callback.message.entities ||
+            [];
+          const text: string =
+            callback.message.caption || callback.message.text || "";
           for (const ent of entities) {
             const t = ent.type;
-            if (t === 'text_link' && ent.url) {
+            if (t === "text_link" && ent.url) {
               const m = ent.url.match(/\/pay\/([^/?#]+)/);
-              if (m) { reqId = m[1]; break; }
+              if (m) {
+                reqId = m[1];
+                break;
+              }
             }
           }
           if (!reqId) {
@@ -117,40 +173,51 @@ export async function POST(req: NextRequest) {
           if (!reqId) {
             try {
               const rm: any = (callback.message as any)?.reply_markup;
-              const rows: any[] = Array.isArray(rm?.inline_keyboard) ? rm.inline_keyboard : [];
+              const rows: any[] = Array.isArray(rm?.inline_keyboard)
+                ? rm.inline_keyboard
+                : [];
               for (const row of rows) {
                 for (const btn of row) {
                   const u: string | undefined = btn?.url;
-                  if (u && typeof u === 'string') {
+                  if (u && typeof u === "string") {
                     let m = u.match(/\/pay\/([^\/?#]+)/);
-                    if (m) { reqId = m[1]; break; }
+                    if (m) {
+                      reqId = m[1];
+                      break;
+                    }
                     m = u.match(/scan\.request\.network\/request\/([^\/?#]+)/);
-                    if (m) { reqId = m[1]; break; }
+                    if (m) {
+                      reqId = m[1];
+                      break;
+                    }
                   }
                 }
                 if (reqId) break;
               }
             } catch {}
           }
-          if (!reqId) throw new Error('request id not found');
+          if (!reqId) throw new Error("request id not found");
         } catch (err: any) {
           // Fallback: look up requestId by chatId/messageId from S3 index (optional)
           try {
             const s3env = await loadS3();
-            if (!s3env) throw new Error('S3 not configured');
-            const { s3, GetObjectCommand, AWS_S3_BUCKET, PATH_INVOICES } = s3env as any;
+            if (!s3env) throw new Error("S3 not configured");
+            const { s3, GetObjectCommand, AWS_S3_BUCKET, PATH_INVOICES } =
+              s3env as any;
             const key = `${PATH_INVOICES}by-message/${chatIdCb}/${messageIdCb}.json`;
-            const obj = await s3.send(new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key }));
+            const obj = await s3.send(
+              new GetObjectCommand({ Bucket: AWS_S3_BUCKET, Key: key })
+            );
             const text = await (obj.Body as any).transformToString();
-            const rec = JSON.parse(text || '{}');
+            const rec = JSON.parse(text || "{}");
             const rid = rec?.requestId || rec?.id;
-            if (rid && typeof rid === 'string') {
+            if (rid && typeof rid === "string") {
               reqId = rid;
             } else {
-              throw new Error('request id not found');
+              throw new Error("request id not found");
             }
           } catch (e) {
-            await tg.answerCallback(callback.id, 'Unable to refresh status');
+            await tg.answerCallback(callback.id, "Unable to refresh status");
             return NextResponse.json({ ok: false });
           }
         }
@@ -161,21 +228,39 @@ export async function POST(req: NextRequest) {
           try {
             const resp = await fetch(url);
             const txt = await resp.text();
-            try { s = JSON.parse(txt); } catch { s = { status: resp.ok ? 'pending' : 'error', error: txt.slice(0, 200) }; }
+            try {
+              s = JSON.parse(txt);
+            } catch {
+              s = {
+                status: resp.ok ? "pending" : "error",
+                error: txt.slice(0, 200),
+              };
+            }
           } catch (netErr: any) {
-            throw new Error(`status fetch failed: ${netErr?.message || 'network'}`);
+            throw new Error(
+              `status fetch failed: ${netErr?.message || "network"}`
+            );
           }
-          const status = String(s?.status || 'pending');
-          const emoji = status === 'paid' ? '✅' : status === 'pending' ? '🟡' : '❌';
-          const newStatusText = `Click for Status: ${emoji} ${status.charAt(0).toUpperCase()}${status.slice(1)}`;
+          const status = String(s?.status || "pending");
+          const emoji =
+            status === "paid" ? "✅" : status === "pending" ? "🟡" : "❌";
+          const newStatusText = `Click for Status: ${emoji} ${status
+            .charAt(0)
+            .toUpperCase()}${status.slice(1)}`;
           // If markup already has identical Status button text, skip editing to avoid 400 not-modified
-          let prevStatusText = '';
+          let prevStatusText = "";
           try {
             const rm: any = (callback.message as any)?.reply_markup;
-            const rows: any[] = Array.isArray(rm?.inline_keyboard) ? rm.inline_keyboard : [];
+            const rows: any[] = Array.isArray(rm?.inline_keyboard)
+              ? rm.inline_keyboard
+              : [];
             for (const row of rows) {
               for (const btn of row) {
-                if (btn && typeof btn.text === 'string' && btn.text.startsWith('Status:')) {
+                if (
+                  btn &&
+                  typeof btn.text === "string" &&
+                  btn.text.startsWith("Status:")
+                ) {
                   prevStatusText = btn.text;
                   break;
                 }
@@ -183,32 +268,54 @@ export async function POST(req: NextRequest) {
               if (prevStatusText) break;
             }
           } catch {}
-          const kb = { inline_keyboard: [
-            [{ text: 'Open invoice', url: `${base}/pay/${reqId}` }],
-            [{ text: 'View on Request Scan', url: `https://scan.request.network/request/${reqId}` }],
-            [{ text: newStatusText, callback_data: 'sr' }],
-          ] } as any;
-          if (status === 'paid') {
+          const kb = {
+            inline_keyboard: [
+              [{ text: "Open invoice", url: `${base}/pay/${reqId}` }],
+              [
+                {
+                  text: "View on Request Scan",
+                  url: `https://scan.request.network/request/${reqId}`,
+                },
+              ],
+              [{ text: newStatusText, callback_data: "sr" }],
+            ],
+          } as any;
+          if (status === "paid") {
             // Try to fetch last-known payment details to enrich caption
-            let pretty = '✅ PAID';
+            let pretty = "✅ PAID";
             try {
-              const s2 = await fetch(`${base}/api/status?id=${encodeURIComponent(reqId)}`).then(r => r.json());
-              const amt = (s2?.balance?.paidAmount || s2?.amount || '').toString();
-              const currency = (s2?.currency || 'ETH').toString().toUpperCase();
-              const tsIso = (s2?.timestamp || new Date().toISOString()).toString();
+              const s2 = await fetch(
+                `${base}/api/status?id=${encodeURIComponent(reqId)}`
+              ).then((r) => r.json());
+              const amt = (
+                s2?.balance?.paidAmount ||
+                s2?.amount ||
+                ""
+              ).toString();
+              const currency = (s2?.currency || "ETH").toString().toUpperCase();
+              const tsIso = (
+                s2?.timestamp || new Date().toISOString()
+              ).toString();
               const d = new Date(tsIso);
-              const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-              const dd = String(d.getUTCDate()).padStart(2, '0');
+              const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+              const dd = String(d.getUTCDate()).padStart(2, "0");
               const yy = String(d.getUTCFullYear()).slice(-2);
-              const hh = String(d.getUTCHours()).padStart(2, '0');
-              const mi = String(d.getUTCMinutes()).padStart(2, '0');
-              const net = (s2?.network || 'mainnet').toString();
+              const hh = String(d.getUTCHours()).padStart(2, "0");
+              const mi = String(d.getUTCMinutes()).padStart(2, "0");
+              const net = (s2?.network || "mainnet").toString();
               const netName = net.charAt(0).toUpperCase() + net.slice(1);
-              pretty = `✅ ${amt || ''} ${currency} paid on ${mm}/${dd}/${yy} @ ${hh}:${mi} UTC\nOn ${netName}\nPowered by Request Network`;
+              pretty = `✅ ${
+                amt || ""
+              } ${currency} paid on ${mm}/${dd}/${yy} @ ${hh}:${mi} UTC\nOn ${netName}\nPowered by Request Network`;
             } catch {}
             const mediaUrl = `${base}/Dial.letters.transparent.bg.crop.png`;
             try {
-              await tg.editMedia(chatIdCb, messageIdCb, { type: 'photo', media: mediaUrl, caption: pretty }, kb);
+              await tg.editMedia(
+                chatIdCb,
+                messageIdCb,
+                { type: "photo", media: mediaUrl, caption: pretty },
+                kb
+              );
             } catch {
               // If media unchanged or fails, still attempt markup edit when different
               if (prevStatusText !== newStatusText) {
@@ -220,7 +327,7 @@ export async function POST(req: NextRequest) {
           }
           await tg.answerCallback(callback.id, newStatusText);
         } catch (e: any) {
-          await tg.answerCallback(callback.id, e?.message || 'Error');
+          await tg.answerCallback(callback.id, e?.message || "Error");
         }
         return NextResponse.json({ ok: true });
       }
@@ -229,7 +336,7 @@ export async function POST(req: NextRequest) {
     const inline = body?.inline_query;
     if (inline && inline.id) {
       const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-      const q: string = (inline.query || '').trim();
+      const q: string = (inline.query || "").trim();
       const m = q.match(/\d+(?:\.\d+)?/);
       const amt = m ? Number(m[0]) : undefined;
 
@@ -237,54 +344,72 @@ export async function POST(req: NextRequest) {
 
       // Open app quick action
       results.push({
-        type: 'article',
-        id: 'open-app',
-        title: 'Open Dial Pay',
-        description: 'Launch the mini app to request or send',
-        input_message_content: { message_text: 'Open Dial Pay' },
+        type: "article",
+        id: "open-app",
+        title: "Open Dial Pay",
+        description: "Launch the mini app to request or send",
+        input_message_content: { message_text: "Open Dial Pay" },
         reply_markup: {
-          inline_keyboard: [[{ text: 'Open app', web_app: { url: baseUrl } }]],
+          inline_keyboard: [[{ text: "Open app", web_app: { url: baseUrl } }]],
         },
       });
 
       const quick = [5, 10, 20, 50];
       for (const v of quick) {
         results.push({
-          type: 'article',
+          type: "article",
           id: `req-${v}`,
           title: `Request $${v}`,
-          description: 'Create an invoice for this amount',
+          description: "Create an invoice for this amount",
           input_message_content: { message_text: `Request $${v}` },
           reply_markup: {
-            inline_keyboard: [[{ text: 'Create invoice', web_app: { url: `${baseUrl}?amount=${v}` } }]],
+            inline_keyboard: [
+              [
+                {
+                  text: "Create invoice",
+                  web_app: { url: `${baseUrl}?amount=${v}` },
+                },
+              ],
+            ],
           },
         });
       }
 
       if (amt && amt > 0) {
         results.unshift({
-          type: 'article',
+          type: "article",
           id: `req-custom-${amt}`,
           title: `Request $${amt}`,
-          description: 'Create an invoice for this amount',
+          description: "Create an invoice for this amount",
           input_message_content: { message_text: `Request $${amt}` },
           reply_markup: {
-            inline_keyboard: [[{ text: 'Create invoice', web_app: { url: `${baseUrl}?amount=${amt}` } }]],
+            inline_keyboard: [
+              [
+                {
+                  text: "Create invoice",
+                  web_app: { url: `${baseUrl}?amount=${amt}` },
+                },
+              ],
+            ],
           },
         });
       }
 
-      await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/answerInlineQuery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ inline_query_id: inline.id, results, cache_time: 1, is_personal: true }),
-      });
+      await fetch(
+        `https://api.telegram.org/bot${process.env.BOT_TOKEN}/answerInlineQuery`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            inline_query_id: inline.id,
+            results,
+            cache_time: 1,
+            is_personal: true,
+          }),
+        }
+      );
       return NextResponse.json({ ok: true });
     }
-
-    
-
-    
 
     // Handle callback queries (inline button presses)
     const callbackQuery = body?.callback_query;
@@ -296,255 +421,400 @@ export async function POST(req: NextRequest) {
       const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
 
       // Answer callback query to remove loading state
-      await tgCall('answerCallbackQuery', { callback_query_id: callbackQueryId });
+      await tgCall("answerCallbackQuery", {
+        callback_query_id: callbackQueryId,
+      });
 
-      if (callbackData === 'quick_invoice') {
+      if (callbackData === "quick_invoice") {
         const keyboard = {
           inline_keyboard: [
             [
-              { text: '💵 5 USDC', callback_data: 'invoice_5_USDC' },
-              { text: '💵 10 USDC', callback_data: 'invoice_10_USDC' }
+              { text: "💵 5 USDC", callback_data: "invoice_5_USDC" },
+              { text: "💵 10 USDC", callback_data: "invoice_10_USDC" },
             ],
             [
-              { text: '💵 20 USDC', callback_data: 'invoice_20_USDC' },
-              { text: '💵 50 USDC', callback_data: 'invoice_50_USDC' }
+              { text: "💵 20 USDC", callback_data: "invoice_20_USDC" },
+              { text: "💵 50 USDC", callback_data: "invoice_50_USDC" },
             ],
-            [
-              { text: '💰 Custom Amount', web_app: { url: baseUrl } }
-            ]
-          ]
+            [{ text: "💰 Custom Amount", web_app: { url: baseUrl } }],
+          ],
         };
-        await tgCall('sendMessage', {
+        await tgCall("sendMessage", {
           chat_id: callbackChatId,
-          text: '📨 *Quick Invoice*\n\nSelect an amount to create an invoice:',
+          text: "📨 *Quick Invoice*\n\nSelect an amount to create an invoice:",
           reply_markup: keyboard,
-          parse_mode: 'Markdown'
+          parse_mode: "Markdown",
         });
-      } else if (callbackData === 'quick_send') {
-        await tgCall('sendMessage', {
+      } else if (callbackData === "quick_send") {
+        await tgCall("sendMessage", {
           chat_id: callbackChatId,
-          text: '⚡ *Quick Send*\n\nTo send crypto, use:\n`/send @username <amount> <asset>`\n\nExample:\n`/send @john 10 USDC`',
-          parse_mode: 'Markdown'
+          text: "⚡ *Quick Send*\n\nTo send crypto, use:\n`/send @username <amount> <asset>`\n\nExample:\n`/send @john 10 USDC`",
+          parse_mode: "Markdown",
         });
-      } else if (callbackData === 'create_party') {
-        await tgCall('sendMessage', {
+      } else if (callbackData === "create_party") {
+        await tgCall("sendMessage", {
           chat_id: callbackChatId,
-          text: '🎉 *Create Party*\n\nTo create a party room, use:\n`/startparty`\n\nOr provide your wallet address:\n`/startparty 0xYourAddress`',
-          parse_mode: 'Markdown'
+          text: "🎉 *Create Party*\n\nTo create a party room, use:\n`/startparty`\n\nOr provide your wallet address:\n`/startparty 0xYourAddress`",
+          parse_mode: "Markdown",
         });
-      } else if (callbackData === 'list_parties') {
-        await tgCall('sendMessage', {
+      } else if (callbackData === "list_parties") {
+        await tgCall("sendMessage", {
           chat_id: callbackChatId,
-          text: '🔍 *Finding Parties*\n\n• List all parties: `/listparty`\n• Search parties: `/findparty <keyword>`\n\nExample:\n`/findparty room123`',
-          parse_mode: 'Markdown'
+          text: "🔍 *Finding Parties*\n\n• List all parties: `/listparty`\n• Search parties: `/findparty <keyword>`\n\nExample:\n`/findparty room123`",
+          parse_mode: "Markdown",
         });
-      } else if (callbackData === 'view_balance') {
-        await tgCall('sendMessage', {
+      } else if (callbackData === "view_balance") {
+        await tgCall("sendMessage", {
           chat_id: callbackChatId,
-          text: '💳 *View Balance*\n\nUse `/balance` to view your wallet balance, or open the app to see detailed balances.',
+          text: "💳 *View Balance*\n\nUse `/balance` to view your wallet balance, or open the app to see detailed balances.",
           reply_markup: {
-            inline_keyboard: [[{ text: '💰 Open Dial Pay', web_app: { url: baseUrl } }]]
+            inline_keyboard: [
+              [{ text: "💰 Open Dial Pay", web_app: { url: baseUrl } }],
+            ],
           },
-          parse_mode: 'Markdown'
+          parse_mode: "Markdown",
         });
-      } else if (callbackData === 'help') {
+      } else if (callbackData === "help") {
         const keyboard = {
           inline_keyboard: [
-            [{ text: '💰 Open Dial Pay', web_app: { url: baseUrl } }]
-          ]
+            [{ text: "💰 Open Dial Pay", web_app: { url: baseUrl } }],
+          ],
         };
-        await tgCall('sendMessage', {
+        await tgCall("sendMessage", {
           chat_id: callbackChatId,
-          text: '❓ *Dial Pay Help*\n\n*💰 Payments:*\n• `/invoice <amount> <asset>` - Create invoice\n• `/send @user <amount> <asset>` - Send crypto\n• `/check <amount> <asset>` - Create voucher\n• `/balance` - View balance\n\n*🎉 Party Lines:*\n• `/startparty` - Create party\n• `/listparty` - List parties\n• `/findparty <keyword>` - Search\n\n*Assets:* USDT, USDC, ETH, BTC, TON, BNB, SOL',
+          text: "❓ *Dial Pay Help*\n\n*💰 Payments:*\n• `/invoice <amount> <asset>` - Create invoice\n• `/send @user <amount> <asset>` - Send crypto\n• `/check <amount> <asset>` - Create voucher\n• `/balance` - View balance\n\n*🎉 Party Lines:*\n• `/startparty` - Create party\n• `/listparty` - List parties\n• `/findparty <keyword>` - Search\n\n*Assets:* USDT, USDC, ETH, BTC, TON, BNB, SOL",
           reply_markup: keyboard,
-          parse_mode: 'Markdown'
+          parse_mode: "Markdown",
         });
-      } else if (callbackData && callbackData.startsWith('invoice_')) {
+      } else if (callbackData && callbackData.startsWith("invoice_")) {
         // Handle quick invoice creation (e.g., invoice_10_USDC)
-        const parts = callbackData.split('_');
+        const parts = callbackData.split("_");
         const amount = parts[1];
-        const asset = parts[2] || 'USDC';
+        const asset = parts[2] || "USDC";
 
-        await tgCall('sendMessage', {
+        await tgCall("sendMessage", {
           chat_id: callbackChatId,
           text: `Creating ${amount} ${asset} invoice...\n\nUse: \`/invoice ${amount} ${asset}\` to create it now!`,
-          parse_mode: 'Markdown'
+          parse_mode: "Markdown",
         });
-      } else if (callbackData && callbackData.startsWith('ai_chat_')) {
+      } else if (callbackData && callbackData.startsWith("ai_chat_")) {
         // Handle AI model selection for chat
-        const modelId = callbackData.replace('ai_chat_', '');
-        
+        const modelId = callbackData.replace("ai_chat_", "");
+
         // Start chat session
-        const { getChatSession } = await import('@/lib/ai-chat-session');
+        const { getChatSession } = await import("@/lib/ai-chat-session");
         getChatSession(callbackUserId, callbackChatId, modelId);
-        
-        await tgCall('sendMessage', {
+
+        await tgCall("sendMessage", {
           chat_id: callbackChatId,
           text: `🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend me a message to chat with the AI.\n\nUse \`/ai-clear\` to end the session.`,
-          parse_mode: 'Markdown'
+          parse_mode: "Markdown",
         });
-      } else if (callbackData && callbackData.startsWith('ai_serve_')) {
+      } else if (callbackData && callbackData.startsWith("ai_serve_")) {
         // Handle Serve & Chat: start model server then open chat session
-        const modelId = callbackData.replace('ai_serve_', '');
+        const modelId = callbackData.replace("ai_serve_", "");
         try {
           const apiBase = req.nextUrl.origin;
           const res = await fetch(`${apiBase}/api/ai/serve`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ modelId }),
           });
           if (!res.ok) {
             const errText = await res.text();
-            await tgCall('sendMessage', {
+            await tgCall("sendMessage", {
               chat_id: callbackChatId,
               text: `❌ Failed to start model: ${errText}`,
             });
           } else {
             // Start chat session immediately
-            const { getChatSession } = await import('@/lib/ai-chat-session');
+            const { getChatSession } = await import("@/lib/ai-chat-session");
             getChatSession(callbackUserId, callbackChatId, modelId);
-            await tgCall('sendMessage', {
+            await tgCall("sendMessage", {
               chat_id: callbackChatId,
               text: `✅ Model started.\n\n🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend me a message to chat with the AI.\n\nUse \`/ai-clear\` to end the session.`,
-              parse_mode: 'Markdown'
+              parse_mode: "Markdown",
             });
           }
         } catch (err: any) {
-          await tgCall('sendMessage', { chat_id: callbackChatId, text: `Error: ${err?.message || 'unknown'}` });
+          await tgCall("sendMessage", {
+            chat_id: callbackChatId,
+            text: `Error: ${err?.message || "unknown"}`,
+          });
         }
-      } else if (callbackData === 'ai_setup_done') {
+      } else if (callbackData === "ai_setup_done") {
         // Next steps after installer
-        const textMsg = '✅ *Installer Complete*\n\nNext steps:\n1) Download a sample model (DeepSeek R1 Qwen 1.5B)\n2) Watch progress with /ai-list\n3) Chat with the model via /ai (Serve & Chat)\n\nTap a button below to continue.';
+        const textMsg =
+          "✅ *Installer Complete*\n\nNext steps:\n1) Download a sample model (DeepSeek R1 Qwen 1.5B)\n2) Watch progress with /ai-list\n3) Chat with the model via /ai (Serve & Chat)\n\nTap a button below to continue.";
         const userBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const keyboard = {
           inline_keyboard: [
-            [{ text: '⬇️ Download DeepSeek (recommended)', callback_data: 'ai_dl_deepseek_r1_qwen15b' }],
-            [{ text: '⬇️ Download Qwen2.5 1.5B (GGUF)', callback_data: 'ai_dl_qwen25_1_5b_gguf' }],
-            [{ text: '📚 Show Models', callback_data: 'ai_show_models' }],
-            [{ text: '💬 Chat Selector', callback_data: 'ai_show_chat_selector' }],
-            [{ text: '🧩 macOS: Copy Command Page', url: `${userBase}/ai/setup/mac` }],
-            [{ text: '⬇️ Linux Installer (.sh)', url: `${userBase}/api/ai/setup/download/linux` }],
-            [{ text: '⬇️ Linux GPU Installer (.sh)', url: `${userBase}/api/ai/setup/download/linux-gpu` }],
+            [
+              {
+                text: "⬇️ Download DeepSeek (recommended)",
+                callback_data: "ai_dl_deepseek_r1_qwen15b",
+              },
+            ],
+            [
+              {
+                text: "⬇️ Download Qwen2.5 1.5B (GGUF)",
+                callback_data: "ai_dl_qwen25_1_5b_gguf",
+              },
+            ],
+            [{ text: "📚 Show Models", callback_data: "ai_show_models" }],
+            [
+              {
+                text: "💬 Chat Selector",
+                callback_data: "ai_show_chat_selector",
+              },
+            ],
+            [
+              {
+                text: "🧩 macOS: Copy Command Page",
+                url: `${userBase}/ai/setup/mac`,
+              },
+            ],
+            [
+              {
+                text: "⬇️ Linux Installer (.sh)",
+                url: `${userBase}/api/ai/setup/download/linux`,
+              },
+            ],
+            [
+              {
+                text: "⬇️ Linux GPU Installer (.sh)",
+                url: `${userBase}/api/ai/setup/download/linux-gpu`,
+              },
+            ],
           ],
         } as any;
-        await tgCall('sendMessage', { chat_id: callbackChatId, text: textMsg, parse_mode: 'Markdown', reply_markup: keyboard });
-      } else if (callbackData === 'ai_dl_deepseek_r1_qwen15b') {
+        await tgCall("sendMessage", {
+          chat_id: callbackChatId,
+          text: textMsg,
+          parse_mode: "Markdown",
+          reply_markup: keyboard,
+        });
+      } else if (callbackData === "ai_dl_deepseek_r1_qwen15b") {
         // Trigger sample model download
         try {
-          const url = 'https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B';
-          const msg = '🚀 Starting download: DeepSeek R1 Qwen 1.5B\n\n• This may take time depending on size and peers.\n• Use /ai-list to see progress.\n• When ready, use /ai to Serve & Chat.';
-          const kb = { inline_keyboard: [[{ text: '📚 Show Models', callback_data: 'ai_show_models' }]] } as any;
-          await tgCall('sendMessage', { chat_id: callbackChatId, text: msg, parse_mode: 'Markdown', reply_markup: kb });
+          const url =
+            "https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B";
+          const msg =
+            "🚀 Starting download: DeepSeek R1 Qwen 1.5B\n\n• This may take time depending on size and peers.\n• Use /ai-list to see progress.\n• When ready, use /ai to Serve & Chat.";
+          const kb = {
+            inline_keyboard: [
+              [{ text: "📚 Show Models", callback_data: "ai_show_models" }],
+            ],
+          } as any;
+          await tgCall("sendMessage", {
+            chat_id: callbackChatId,
+            text: msg,
+            parse_mode: "Markdown",
+            reply_markup: kb,
+          });
 
           // Kick off background download without internal HTTP hop
           (async () => {
             try {
-              const { addModelFromHuggingFace } = await import('@/lib/ai-model-manager');
-              await addModelFromHuggingFace({ huggingFaceUrl: url, createTorrent: true });
+              const { addModelFromHuggingFace } = await import(
+                "@/lib/ai-model-manager"
+              );
+              await addModelFromHuggingFace({
+                huggingFaceUrl: url,
+                createTorrent: true,
+              });
             } catch (e) {
-              try { console.error('[Bot] Background download error:', e); } catch {}
+              try {
+                console.error("[Bot] Background download error:", e);
+              } catch {}
             }
           })();
         } catch (err: any) {
-          await tgCall('sendMessage', { chat_id: callbackChatId, text: `Error: ${err?.message || 'unknown'}` });
+          await tgCall("sendMessage", {
+            chat_id: callbackChatId,
+            text: `Error: ${err?.message || "unknown"}`,
+          });
         }
-      } else if (callbackData === 'ai_dl_qwen25_1_5b_gguf') {
+      } else if (callbackData === "ai_dl_qwen25_1_5b_gguf") {
         // Trigger Qwen2.5 1.5B Instruct GGUF sample download
         try {
-          const url = 'https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF';
-          const msg = '🚀 Starting download: Qwen2.5 1.5B Instruct (GGUF)\n\n• This may take time depending on size and peers.\n• Use /ai-list to see progress.\n• When ready, use /ai to Serve & Chat.';
-          const kb = { inline_keyboard: [[{ text: '📚 Show Models', callback_data: 'ai_show_models' }]] } as any;
-          await tgCall('sendMessage', { chat_id: callbackChatId, text: msg, parse_mode: 'Markdown', reply_markup: kb });
+          const url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF";
+          const msg =
+            "🚀 Starting download: Qwen2.5 1.5B Instruct (GGUF)\n\n• This may take time depending on size and peers.\n• Use /ai-list to see progress.\n• When ready, use /ai to Serve & Chat.";
+          const kb = {
+            inline_keyboard: [
+              [{ text: "📚 Show Models", callback_data: "ai_show_models" }],
+            ],
+          } as any;
+          await tgCall("sendMessage", {
+            chat_id: callbackChatId,
+            text: msg,
+            parse_mode: "Markdown",
+            reply_markup: kb,
+          });
 
           (async () => {
             try {
-              const { addModelFromHuggingFace } = await import('@/lib/ai-model-manager');
-              await addModelFromHuggingFace({ huggingFaceUrl: url, createTorrent: true });
+              const { addModelFromHuggingFace } = await import(
+                "@/lib/ai-model-manager"
+              );
+              await addModelFromHuggingFace({
+                huggingFaceUrl: url,
+                createTorrent: true,
+              });
             } catch (e) {
-              try { console.error('[Bot] Background download error (Qwen2.5 GGUF):', e); } catch {}
+              try {
+                console.error(
+                  "[Bot] Background download error (Qwen2.5 GGUF):",
+                  e
+                );
+              } catch {}
             }
           })();
         } catch (err: any) {
-          await tgCall('sendMessage', { chat_id: callbackChatId, text: `Error: ${err?.message || 'unknown'}` });
+          await tgCall("sendMessage", {
+            chat_id: callbackChatId,
+            text: `Error: ${err?.message || "unknown"}`,
+          });
         }
-      } else if (callbackData === 'ai_show_models') {
-        const { handleAiListCommand } = await import('@/lib/bot/ai-commands');
+      } else if (callbackData === "ai_show_models") {
+        const { handleAiListCommand } = await import("@/lib/bot/ai-commands");
         const message = handleAiListCommand();
-        const kb = { inline_keyboard: [[{ text: '💬 Chat Selector', callback_data: 'ai_show_chat_selector' }]] } as any;
-        await tgCall('sendMessage', { chat_id: callbackChatId, text: message, parse_mode: 'Markdown', reply_markup: kb });
-      } else if (callbackData === 'ai_show_chat_selector') {
-        const { handleAiChatCommand } = await import('@/lib/bot/ai-commands');
+        const kb = {
+          inline_keyboard: [
+            [
+              {
+                text: "💬 Chat Selector",
+                callback_data: "ai_show_chat_selector",
+              },
+            ],
+          ],
+        } as any;
+        await tgCall("sendMessage", {
+          chat_id: callbackChatId,
+          text: message,
+          parse_mode: "Markdown",
+          reply_markup: kb,
+        });
+      } else if (callbackData === "ai_show_chat_selector") {
+        const { handleAiChatCommand } = await import("@/lib/bot/ai-commands");
         const { message, keyboard } = handleAiChatCommand();
-        await tgCall('sendMessage', { chat_id: callbackChatId, text: message, parse_mode: 'Markdown', reply_markup: keyboard });
+        await tgCall("sendMessage", {
+          chat_id: callbackChatId,
+          text: message,
+          parse_mode: "Markdown",
+          reply_markup: keyboard,
+        });
       }
 
       return NextResponse.json({ ok: true });
     }
 
     const msg = body?.message;
-    const text: string = msg?.text || '';
+    const text: string = msg?.text || "";
     const chatId = msg?.chat?.id;
     const chatType: string | undefined = msg?.chat?.type;
     const tgUserId = msg?.from?.id;
 
     if (!chatId || !tgUserId) return NextResponse.json({ ok: true });
 
-    const reply = async (text: string) => { const r = await tg.sendMessage(chatId, text); return !!r?.ok; };
+    const reply = async (text: string) => {
+      const r = await tg.sendMessage(chatId, text);
+      return !!r?.ok;
+    };
 
     if (DEBUG) {
-      await reply(`dbg: chatType=${chatType} isCmd=${typeof text === 'string' && text.startsWith('/')} text="${text}"`);
+      await reply(
+        `dbg: chatType=${chatType} isCmd=${
+          typeof text === "string" && text.startsWith("/")
+        } text="${text}"`
+      );
     }
 
     // Avoid spamming group chats: only act on slash commands. In DMs, allow normal flow.
-    const isCommand = typeof text === 'string' && text.startsWith('/');
-    if (!isCommand && chatType !== 'private') {
+    const isCommand = typeof text === "string" && text.startsWith("/");
+    if (!isCommand && chatType !== "private") {
       return NextResponse.json({ ok: true });
     }
 
     // /ai-seeding, /ai_seeding, or /aiseeding - Show swarm seeding status and short codes
     if (/^\/ai[-_]?seeding\b/i.test(text)) {
       try {
-        const { listAggregated } = await import('@/lib/swarm-client');
-        const { getAllModels } = await import('@/lib/ai-model-storage');
+        const { listAggregated } = await import("@/lib/swarm-client");
+        const { getAllModels } = await import("@/lib/ai-model-storage");
         const serverBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const aggregated = await listAggregated(serverBase).catch(() => [] as any[]);
+        const aggregated = await listAggregated(serverBase).catch(
+          () => [] as any[]
+        );
 
-        let message = '🌐 *AI Seeding (Swarm)*\n\n';
+        let message = "🌐 *AI Seeding (Swarm)*\n\n";
         if (aggregated && aggregated.length > 0) {
           aggregated.slice(0, 25).forEach((e: any, idx: number) => {
             message += `${idx + 1}. ${e.name}  (\`${e.code}\`)\n`;
             message += `   Nodes: ${e.nodes}  Seeders: ${e.totalSeeders}  Peers: ${e.peers}\n`;
-            const sample = e.examples?.slice(0, 3).map((x: any) => `${x.status}${typeof x.seeders === 'number' ? `:${x.seeders}` : ''}`).join(', ');
+            const sample = e.examples
+              ?.slice(0, 3)
+              .map(
+                (x: any) =>
+                  `${x.status}${
+                    typeof x.seeders === "number" ? `:${x.seeders}` : ""
+                  }`
+              )
+              .join(", ");
             if (sample) message += `   Examples: ${sample}\n`;
             message += `\n`;
           });
-          message += 'Use `/ask <message> #<code>` to target a model. Omit the code to auto-pick the most-seeded model.';
+          message +=
+            "Use `/ask <message> #<code>` to target a model. Omit the code to auto-pick the most-seeded model.";
         } else {
           // Fallback to local-only list
-          const models = getAllModels().filter(m => m.status === 'serving' || m.status === 'ready');
-          models.sort((a, b) => (a.status === 'serving' ? -1 : 1) - (b.status === 'serving' ? -1 : 1));
+          const models = getAllModels().filter(
+            (m) => m.status === "serving" || m.status === "ready"
+          );
+          models.sort(
+            (a, b) =>
+              (a.status === "serving" ? -1 : 1) -
+              (b.status === "serving" ? -1 : 1)
+          );
           if (models.length === 0) {
-            message += 'No models are currently serving or ready. Use `/ai-serve <model_id>` to start one.';
+            message +=
+              "No models are currently serving or ready. Use `/ai-serve <model_id>` to start one.";
           } else {
-            const { createHash } = await import('crypto');
+            const { createHash } = await import("crypto");
             const codeFor = (m: any) => {
-              if (m.infoHash) return String(m.infoHash).slice(0,7).toLowerCase();
-              const basis = m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
-              return createHash('sha1').update(basis).digest('hex').slice(0,7).toLowerCase();
+              if (m.infoHash)
+                return String(m.infoHash).slice(0, 7).toLowerCase();
+              const basis =
+                m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
+              return createHash("sha1")
+                .update(basis)
+                .digest("hex")
+                .slice(0, 7)
+                .toLowerCase();
             };
             models.slice(0, 25).forEach((m, idx) => {
               const code = codeFor(m);
               message += `${idx + 1}. ${m.name || m.id}  (\`${code}\`)\n`;
               message += `   Status: ${m.status}  Peers: ${m.peers || 0}\n`;
-              const prog = typeof m.downloadProgress === 'number' ? `  ${Math.round(m.downloadProgress)}%` : '';
+              const prog =
+                typeof m.downloadProgress === "number"
+                  ? `  ${Math.round(m.downloadProgress)}%`
+                  : "";
               message += `   Status: ${m.status}${prog}\n\n`;
             });
           }
         }
 
-        await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: message,
+          parse_mode: "Markdown",
+        });
       } catch (err: any) {
-        await tgCall('sendMessage', { chat_id: chatId, text: `Error: ${err?.message || 'unknown'}` });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: `Error: ${err?.message || "unknown"}`,
+        });
       }
       return NextResponse.json({ ok: true });
     }
@@ -552,56 +822,75 @@ export async function POST(req: NextRequest) {
     // /miner - Dashboard of this node (hardware, OS, load, serving, seeding)
     if (/^\/miner\b/i.test(text)) {
       try {
-        const { getServingModels, getAllModels, getServeStatus, formatBytes } = await import('@/lib/ai-model-storage');
-        const { createHash } = await import('crypto');
-        const { getPeerId } = await import('@/lib/swarm-client');
-        const os = await import('os');
-        const base = (process.env.PUBLIC_BASE_URL || req.nextUrl.origin).replace(/\/$/, '');
+        const { getServingModels, getAllModels, getServeStatus, formatBytes } =
+          await import("@/lib/ai-model-storage");
+        const { createHash } = await import("crypto");
+        const { getPeerId } = await import("@/lib/swarm-client");
+        const os = await import("os");
+        const base = (
+          process.env.PUBLIC_BASE_URL || req.nextUrl.origin
+        ).replace(/\/$/, "");
         const peerId = getPeerId(base);
 
         // System / hardware
-        const cpus = typeof os.cpus === 'function' ? os.cpus() : [] as any[];
-        const cpuModel = cpus[0]?.model || 'Unknown CPU';
+        const cpus = typeof os.cpus === "function" ? os.cpus() : ([] as any[]);
+        const cpuModel = cpus[0]?.model || "Unknown CPU";
         const cores = cpus.length || 0;
-        const arch = typeof os.arch === 'function' ? os.arch() : process.arch;
-        const platform = typeof os.platform === 'function' ? os.platform() : process.platform;
-        const release = typeof os.release === 'function' ? os.release() : '';
-        const totalMemB = typeof os.totalmem === 'function' ? os.totalmem() : 0;
-        const freeMemB = typeof os.freemem === 'function' ? os.freemem() : 0;
-        const load = typeof os.loadavg === 'function' ? os.loadavg() : [0,0,0];
-        const sysUptimeSec = typeof os.uptime === 'function' ? Math.floor(os.uptime()) : 0;
-        const nodeVer = process.versions?.node || '';
+        const arch = typeof os.arch === "function" ? os.arch() : process.arch;
+        const platform =
+          typeof os.platform === "function" ? os.platform() : process.platform;
+        const release = typeof os.release === "function" ? os.release() : "";
+        const totalMemB = typeof os.totalmem === "function" ? os.totalmem() : 0;
+        const freeMemB = typeof os.freemem === "function" ? os.freemem() : 0;
+        const load =
+          typeof os.loadavg === "function" ? os.loadavg() : [0, 0, 0];
+        const sysUptimeSec =
+          typeof os.uptime === "function" ? Math.floor(os.uptime()) : 0;
+        const nodeVer = process.versions?.node || "";
         const procUptimeSec = Math.floor(process.uptime());
 
         const serving = getServingModels();
         const allModels = getAllModels();
         const now = Date.now();
         const codeFor = (m: any) => {
-          if (m.infoHash) return String(m.infoHash).slice(0,7).toLowerCase();
-          const basis = m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
-          return createHash('sha1').update(basis).digest('hex').slice(0,7).toLowerCase();
+          if (m.infoHash) return String(m.infoHash).slice(0, 7).toLowerCase();
+          const basis =
+            m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
+          return createHash("sha1")
+            .update(basis)
+            .digest("hex")
+            .slice(0, 7)
+            .toLowerCase();
         };
 
-        const fmtUptime = (s: number) => s < 3600
-          ? `${Math.floor(s/60)}m ${s%60}s`
-          : `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+        const fmtUptime = (s: number) =>
+          s < 3600
+            ? `${Math.floor(s / 60)}m ${s % 60}s`
+            : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 
-        let message = '';
+        let message = "";
         message += `⛏️ *Miner Dashboard*\n`;
         message += `Peer: \`${peerId}\`\n`;
         message += `Base: ${base}  Port: 3000\n\n`;
 
         message += `🖥️ *Hardware*\n`;
         message += `CPU: ${cpuModel}  Cores: ${cores}  Arch: ${arch}\n`;
-        message += `Memory: ${formatBytes(totalMemB)} total, ${formatBytes(freeMemB)} free\n\n`;
+        message += `Memory: ${formatBytes(totalMemB)} total, ${formatBytes(
+          freeMemB
+        )} free\n\n`;
 
         message += `🧰 *System*\n`;
         message += `OS: ${platform} ${release}  Node: v${nodeVer}\n`;
-        message += `Load (1/5/15m): ${load.map(n => n.toFixed(2)).join('/')}\n`;
-        message += `Uptime: sys ${fmtUptime(sysUptimeSec)}  proc ${fmtUptime(procUptimeSec)}\n\n`;
+        message += `Load (1/5/15m): ${load
+          .map((n) => n.toFixed(2))
+          .join("/")}\n`;
+        message += `Uptime: sys ${fmtUptime(sysUptimeSec)}  proc ${fmtUptime(
+          procUptimeSec
+        )}\n\n`;
 
         if (serving.length === 0) {
-          message += 'No models are currently serving on this node.\n\nUse `/ai-serve <model_id>` to start one.';
+          message +=
+            "No models are currently serving on this node.\n\nUse `/ai-serve <model_id>` to start one.";
         } else {
           let totalReq = 0;
           let totalUptimeSec = 0;
@@ -610,11 +899,15 @@ export async function POST(req: NextRequest) {
           for (const m of serving) {
             const st = getServeStatus(m.id);
             const startedAt = st?.startedAt || 0;
-            const uptimeSec = startedAt ? Math.max(1, Math.floor((now - startedAt) / 1000)) : 0;
+            const uptimeSec = startedAt
+              ? Math.max(1, Math.floor((now - startedAt) / 1000))
+              : 0;
             const req = st?.requestCount || 0;
             const err = st?.errorCount || 0;
-            const rpm = uptimeSec > 0 ? (req / (uptimeSec / 60)).toFixed(2) : '0.00';
-            const uploaded = typeof m.uploadedBytes === 'number' ? m.uploadedBytes : 0;
+            const rpm =
+              uptimeSec > 0 ? (req / (uptimeSec / 60)).toFixed(2) : "0.00";
+            const uploaded =
+              typeof m.uploadedBytes === "number" ? m.uploadedBytes : 0;
             const code = codeFor(m);
             totalReq += req;
             totalUptimeSec += uptimeSec;
@@ -622,10 +915,15 @@ export async function POST(req: NextRequest) {
             const upPretty = fmtUptime(uptimeSec);
             message += `• ${m.name || m.id} (\`${code}\`)\n`;
             message += `   Uptime: ${upPretty}  Requests: ${req}  Errors: ${err}  Rate: ${rpm}/min\n`;
-            message += `   Seeding: ${formatBytes(uploaded)}  Seeders: ${m.seeders || 0}\n`;
+            message += `   Seeding: ${formatBytes(uploaded)}  Seeders: ${
+              m.seeders || 0
+            }\n`;
             message += `\n`;
           }
-          const avgRpm = totalUptimeSec > 0 ? (totalReq / (totalUptimeSec / 60)).toFixed(2) : '0.00';
+          const avgRpm =
+            totalUptimeSec > 0
+              ? (totalReq / (totalUptimeSec / 60)).toFixed(2)
+              : "0.00";
           message += `📈 *Totals*\n`;
           message += `Compute rate (avg): ${avgRpm} req/min\n`;
           message += `Uploaded (all models): ${formatBytes(totalUploaded)}\n`;
@@ -633,42 +931,66 @@ export async function POST(req: NextRequest) {
           message += `Note: compute rate is approximated from request counts and uptime. Token-level accounting will be added later.\n`;
         }
 
-        await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: message,
+          parse_mode: "Markdown",
+        });
       } catch (err: any) {
-        await tgCall('sendMessage', { chat_id: chatId, text: `Error: ${err?.message || 'unknown'}` });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: `Error: ${err?.message || "unknown"}`,
+        });
       }
       return NextResponse.json({ ok: true });
     }
 
     // /ask <message> [#<7hex>] - Ask AI in any chat (group-friendly)
     if (/^\/ask\b/i.test(text)) {
-      let question = text.replace(/^\/ask\b/i, '').trim();
+      let question = text.replace(/^\/ask\b/i, "").trim();
       const codeMatch = question.match(/#([a-f0-9]{7})\b/i);
       const requestedCode = codeMatch?.[1]?.toLowerCase();
       if (requestedCode) {
-        question = question.replace(/#([a-f0-9]{7})\b/i, '').trim();
+        question = question.replace(/#([a-f0-9]{7})\b/i, "").trim();
       }
       if (!question) {
-        await tgCall('sendMessage', { chat_id: chatId, text: 'Usage: /ask <message>\n\nExample: /ask explain JSON in one sentence' });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: "Usage: /ask <message>\n\nExample: /ask explain JSON in one sentence",
+        });
         return NextResponse.json({ ok: true });
       }
 
       try {
-        const { getActiveSession, getSessionMessages, addMessageToSession, getChatSession } = await import('@/lib/ai-chat-session');
-        const { getServingModels, getAllModels } = await import('@/lib/ai-model-storage');
-        const { listAggregated, remoteChat } = await import('@/lib/swarm-client');
-        const { chat } = await import('@/lib/ai-inference');
-        const { createHash } = await import('crypto');
+        const {
+          getActiveSession,
+          getSessionMessages,
+          addMessageToSession,
+          getChatSession,
+        } = await import("@/lib/ai-chat-session");
+        const { getServingModels, getAllModels } = await import(
+          "@/lib/ai-model-storage"
+        );
+        const { listAggregated, remoteChat } = await import(
+          "@/lib/swarm-client"
+        );
+        const { chat } = await import("@/lib/ai-inference");
+        const { createHash } = await import("crypto");
 
         // Append user message to session regardless of routing path
-        const session = getChatSession(tgUserId, chatId, ''); // placeholder session, will set model below
-        addMessageToSession(tgUserId, chatId, { role: 'user', content: question });
+        const session = getChatSession(tgUserId, chatId, ""); // placeholder session, will set model below
+        addMessageToSession(tgUserId, chatId, {
+          role: "user",
+          content: question,
+        });
         const messages = getSessionMessages(tgUserId, chatId);
 
         const serverBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const aggregated = await listAggregated(serverBase).catch(() => [] as any[]);
+        const aggregated = await listAggregated(serverBase).catch(
+          () => [] as any[]
+        );
 
-        const norm = (u: string) => u.replace(/\/$/, '').toLowerCase();
+        const norm = (u: string) => u.replace(/\/$/, "").toLowerCase();
         const isSelf = (u: string) => norm(u) === norm(serverBase);
 
         let answered = false;
@@ -677,25 +999,53 @@ export async function POST(req: NextRequest) {
         if (aggregated && aggregated.length > 0) {
           // If multiple peers can do next_token, use the composer
           try {
-            const preferCode = (requestedCode && requestedCode.toLowerCase()) || String(aggregated[0]?.code || '').toLowerCase();
+            const preferCode =
+              (requestedCode && requestedCode.toLowerCase()) ||
+              String(aggregated[0]?.code || "").toLowerCase();
             if (preferCode) {
-              const entry = aggregated.find((e: any) => String(e.code).toLowerCase() === preferCode);
-              const examples = Array.isArray(entry?.examples) ? entry.examples : [];
-              const capable = examples.filter((ex: any) => ex && ex.status === 'serving' && ex.publicUrl && (Array.isArray(ex.capabilities) ? ex.capabilities.includes('next_token') : true));
+              const entry = aggregated.find(
+                (e: any) => String(e.code).toLowerCase() === preferCode
+              );
+              const examples = Array.isArray(entry?.examples)
+                ? entry.examples
+                : [];
+              const capable = examples.filter(
+                (ex: any) =>
+                  ex &&
+                  ex.status === "serving" &&
+                  ex.publicUrl &&
+                  (Array.isArray(ex.capabilities)
+                    ? ex.capabilities.includes("next_token")
+                    : true)
+              );
               if (capable.length >= 2) {
-                const compUrl = `${serverBase.replace(/\/$/, '')}/api/swarm/relay/compose`;
+                const compUrl = `${serverBase.replace(
+                  /\/$/,
+                  ""
+                )}/api/swarm/relay/compose`;
                 const res = await fetch(compUrl, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ code: preferCode, prompt: question, maxTokens: 256, temperature: 0.7 }),
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    code: preferCode,
+                    prompt: question,
+                    maxTokens: 256,
+                    temperature: 0.7,
+                  }),
                   signal: AbortSignal.timeout(60000),
                 });
                 if (res.ok) {
                   const json = await res.json();
-                  const aiResponse = String(json?.text || '');
+                  const aiResponse = String(json?.text || "");
                   if (aiResponse) {
-                    addMessageToSession(tgUserId, chatId, { role: 'assistant', content: aiResponse });
-                    await tgCall('sendMessage', { chat_id: chatId, text: aiResponse });
+                    addMessageToSession(tgUserId, chatId, {
+                      role: "assistant",
+                      content: aiResponse,
+                    });
+                    await tgCall("sendMessage", {
+                      chat_id: chatId,
+                      text: aiResponse,
+                    });
                     answered = true;
                   }
                 }
@@ -707,37 +1057,73 @@ export async function POST(req: NextRequest) {
           }
           // Build a best-first list of candidate examples across entries
           const entries = requestedCode
-            ? aggregated.filter((e: any) => String(e.code).toLowerCase() === requestedCode)
-            : [...aggregated].sort((a: any, b: any) => (b.nodes - a.nodes) || (b.totalSeeders - a.totalSeeders));
+            ? aggregated.filter(
+                (e: any) => String(e.code).toLowerCase() === requestedCode
+              )
+            : [...aggregated].sort(
+                (a: any, b: any) =>
+                  b.nodes - a.nodes || b.totalSeeders - a.totalSeeders
+              );
 
-          const candidates: { publicUrl: string; modelId: string; status: string; seeders?: number }[] = [];
+          const candidates: {
+            publicUrl: string;
+            modelId: string;
+            status: string;
+            seeders?: number;
+          }[] = [];
           for (const e of entries) {
             const examples = Array.isArray(e.examples) ? [...e.examples] : [];
             examples.sort((a: any, b: any) => {
-              const sA = a.status === 'serving' ? 1 : 0;
-              const sB = b.status === 'serving' ? 1 : 0;
+              const sA = a.status === "serving" ? 1 : 0;
+              const sB = b.status === "serving" ? 1 : 0;
               if (sA !== sB) return sB - sA;
               return (b.seeders || 0) - (a.seeders || 0);
             });
             for (const ex of examples) {
-              candidates.push({ publicUrl: ex.publicUrl, modelId: ex.modelId, status: ex.status, seeders: ex.seeders });
+              candidates.push({
+                publicUrl: ex.publicUrl,
+                modelId: ex.modelId,
+                status: ex.status,
+                seeders: ex.seeders,
+              });
             }
           }
 
           // Try remote peers first (non-self), best-first; collect a local candidate as fallback
           for (const c of candidates) {
             if (!c.publicUrl) continue;
-            if (isSelf(c.publicUrl)) { chosenModelId = chosenModelId || c.modelId; continue; }
+            if (isSelf(c.publicUrl)) {
+              chosenModelId = chosenModelId || c.modelId;
+              continue;
+            }
             try {
-              const result = await remoteChat(c.publicUrl, c.modelId, messages, 512, 0.7);
-              const aiResponse = result.content || 'No response';
-              addMessageToSession(tgUserId, chatId, { role: 'assistant', content: aiResponse });
-              await tgCall('sendMessage', { chat_id: chatId, text: aiResponse });
+              const result = await remoteChat(
+                c.publicUrl,
+                c.modelId,
+                messages,
+                512,
+                0.7
+              );
+              const aiResponse = result.content || "No response";
+              addMessageToSession(tgUserId, chatId, {
+                role: "assistant",
+                content: aiResponse,
+              });
+              await tgCall("sendMessage", {
+                chat_id: chatId,
+                text: aiResponse,
+              });
               answered = true;
               break;
             } catch (e) {
               // Try next candidate on failure
-              try { console.warn('[Swarm] remoteChat failed for', c.publicUrl, (e as any)?.message || e); } catch {}
+              try {
+                console.warn(
+                  "[Swarm] remoteChat failed for",
+                  c.publicUrl,
+                  (e as any)?.message || e
+                );
+              } catch {}
               continue;
             }
           }
@@ -754,11 +1140,19 @@ export async function POST(req: NextRequest) {
           // If a short code is provided, try to match it locally
           if (!modelId && requestedCode) {
             const codeFor = (m: any) => {
-              if (m.infoHash) return String(m.infoHash).slice(0,7).toLowerCase();
-              const basis = m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
-              return createHash('sha1').update(basis).digest('hex').slice(0,7).toLowerCase();
+              if (m.infoHash)
+                return String(m.infoHash).slice(0, 7).toLowerCase();
+              const basis =
+                m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id;
+              return createHash("sha1")
+                .update(basis)
+                .digest("hex")
+                .slice(0, 7)
+                .toLowerCase();
             };
-            const match = serving.find(m => codeFor(m) === requestedCode) || getAllModels().find(m => codeFor(m) === requestedCode);
+            const match =
+              serving.find((m) => codeFor(m) === requestedCode) ||
+              getAllModels().find((m) => codeFor(m) === requestedCode);
             if (match) modelId = match.id;
           }
 
@@ -771,54 +1165,83 @@ export async function POST(req: NextRequest) {
           }
 
           if (!modelId) {
-            const { handleAiChatCommand } = await import('@/lib/bot/ai-commands');
+            const { handleAiChatCommand } = await import(
+              "@/lib/bot/ai-commands"
+            );
             const { message, keyboard } = handleAiChatCommand();
-            await tgCall('sendMessage', { chat_id: chatId, text: message + '\n\nTip: Use /ai-seeding to view codes, then `/ask <message> #<code>` or start a server with `/ai-serve <model_id>`.', parse_mode: 'Markdown', reply_markup: keyboard });
+            await tgCall("sendMessage", {
+              chat_id: chatId,
+              text:
+                message +
+                "\n\nTip: Use /ai-seeding to view codes, then `/ask <message> #<code>` or start a server with `/ai-serve <model_id>`.",
+              parse_mode: "Markdown",
+              reply_markup: keyboard,
+            });
             return NextResponse.json({ ok: true });
           }
 
           // Ensure session exists on this user+chat+model and run locally
           getChatSession(tgUserId, chatId, modelId);
-          const data = await chat({ modelId, messages, maxTokens: 512, temperature: 0.7, stream: false });
-          const aiResponse = data.content || 'No response';
-          addMessageToSession(tgUserId, chatId, { role: 'assistant', content: aiResponse });
-          await tgCall('sendMessage', { chat_id: chatId, text: aiResponse });
+          const data = await chat({
+            modelId,
+            messages,
+            maxTokens: 512,
+            temperature: 0.7,
+            stream: false,
+          });
+          const aiResponse = data.content || "No response";
+          addMessageToSession(tgUserId, chatId, {
+            role: "assistant",
+            content: aiResponse,
+          });
+          await tgCall("sendMessage", { chat_id: chatId, text: aiResponse });
         }
       } catch (err: any) {
-        await tgCall('sendMessage', { chat_id: chatId, text: `Error: ${err?.message || 'unknown'}` });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: `Error: ${err?.message || "unknown"}`,
+        });
       }
 
       return NextResponse.json({ ok: true });
     }
 
     // If we are waiting for an address from this user in DM, handle it first
-    if (chatType === 'private' && !isCommand && pendingAddressByUser.has(tgUserId)) {
+    if (
+      chatType === "private" &&
+      !isCommand &&
+      pendingAddressByUser.has(tgUserId)
+    ) {
       const ctx = pendingAddressByUser.get(tgUserId)!;
       const addr = await resolveEnsOrAddress(text);
       if (!addr) {
-        await reply('Could not parse that as an address or ENS. Please send a valid 0x address or ens name.');
+        await reply(
+          "Could not parse that as an address or ENS. Please send a valid 0x address or ens name."
+        );
         return NextResponse.json({ ok: true });
       }
       try {
         const apiBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const rest = await fetch(`${apiBase}/api/invoice`, {
-          method: 'POST',
+          method: "POST",
           headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'x-internal': process.env.INTERNAL_API_KEY || '',
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            "x-internal": process.env.INTERNAL_API_KEY || "",
           },
           body: JSON.stringify({
             payee: addr,
             amount: Number(ctx.amount),
-            note: ctx.note || '',
-            kind: 'request',
-            initData: '',
+            note: ctx.note || "",
+            kind: "request",
+            initData: "",
           }),
         });
         if (!rest.ok) {
           const t = await rest.text();
-          await reply(`Failed to create invoice: ${rest.status} ${rest.statusText}`);
+          await reply(
+            `Failed to create invoice: ${rest.status} ${rest.statusText}`
+          );
           pendingAddressByUser.delete(tgUserId);
           return NextResponse.json({ ok: true, error: t });
         }
@@ -826,12 +1249,19 @@ export async function POST(req: NextRequest) {
         const id = json.requestId || json.requestID || json.id;
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const openUrl = `${baseUrl}/pay/${id}`;
-        const keyboard = { inline_keyboard: [[{ text: 'Open', web_app: { url: openUrl } }]] } as any;
-        await tg.sendMessage(chatId, `Request: $${ctx.amount.toFixed(2)}${ctx.note ? ` — ${ctx.note}` : ''}`,);
+        const keyboard = {
+          inline_keyboard: [[{ text: "Open", web_app: { url: openUrl } }]],
+        } as any;
+        await tg.sendMessage(
+          chatId,
+          `Request: $${ctx.amount.toFixed(2)}${
+            ctx.note ? ` — ${ctx.note}` : ""
+          }`
+        );
         pendingAddressByUser.delete(tgUserId);
         return NextResponse.json({ ok: true, id, payUrl: openUrl });
       } catch (err: any) {
-        await reply(`Error creating request: ${err?.message || 'unknown'}`);
+        await reply(`Error creating request: ${err?.message || "unknown"}`);
         pendingAddressByUser.delete(tgUserId);
         return NextResponse.json({ ok: false });
       }
@@ -848,15 +1278,17 @@ export async function POST(req: NextRequest) {
 
       // Add referral notice if code is present
       if (refCode) {
-        message = `🎉 *You were referred!*\n\nReferral code: \`${refCode}\`\n\n` + message;
+        message =
+          `🎉 *You were referred!*\n\nReferral code: \`${refCode}\`\n\n` +
+          message;
       }
 
       // In private chats, use web_app for native mini app experience
       // In groups, fall back to regular URL buttons
-      const isPrivate = chatType === 'private';
+      const isPrivate = chatType === "private";
 
       // Add referral code to URLs if present
-      const refParam = refCode ? `?ref=${refCode}` : '';
+      const refParam = refCode ? `?ref=${refCode}` : "";
       const mainUrl = `${baseUrl}${refParam}`;
       const referralsUrl = `${baseUrl}/referrals${refParam}`;
 
@@ -864,36 +1296,63 @@ export async function POST(req: NextRequest) {
         inline_keyboard: [
           [
             isPrivate
-              ? { text: '💰 Open Dial Pay', web_app: { url: mainUrl } }
-              : { text: '💰 Open Dial Pay', url: mainUrl }
+              ? { text: "💰 Open Dial Pay", web_app: { url: mainUrl } }
+              : { text: "💰 Open Dial Pay", url: mainUrl },
           ],
           [
             isPrivate
-              ? { text: '📨 Create Invoice', web_app: { url: `${baseUrl}?action=invoice${refCode ? `&ref=${refCode}` : ''}` } }
-              : { text: '📨 Create Invoice', url: `${baseUrl}?action=invoice${refCode ? `&ref=${refCode}` : ''}` },
+              ? {
+                  text: "📨 Create Invoice",
+                  web_app: {
+                    url: `${baseUrl}?action=invoice${
+                      refCode ? `&ref=${refCode}` : ""
+                    }`,
+                  },
+                }
+              : {
+                  text: "📨 Create Invoice",
+                  url: `${baseUrl}?action=invoice${
+                    refCode ? `&ref=${refCode}` : ""
+                  }`,
+                },
             isPrivate
-              ? { text: '⚡ Send Payment', web_app: { url: `${baseUrl}?action=send${refCode ? `&ref=${refCode}` : ''}` } }
-              : { text: '⚡ Send Payment', url: `${baseUrl}?action=send${refCode ? `&ref=${refCode}` : ''}` }
+              ? {
+                  text: "⚡ Send Payment",
+                  web_app: {
+                    url: `${baseUrl}?action=send${
+                      refCode ? `&ref=${refCode}` : ""
+                    }`,
+                  },
+                }
+              : {
+                  text: "⚡ Send Payment",
+                  url: `${baseUrl}?action=send${
+                    refCode ? `&ref=${refCode}` : ""
+                  }`,
+                },
           ],
           [
             isPrivate
-              ? { text: '🤝 Referrals', web_app: { url: referralsUrl } }
-              : { text: '🤝 Referrals', url: referralsUrl },
+              ? { text: "🤝 Referrals", web_app: { url: referralsUrl } }
+              : { text: "🤝 Referrals", url: referralsUrl },
             isPrivate
-              ? { text: '🎉 Party Rooms', web_app: { url: 'https://staging.dial.wtf' } }
-              : { text: '🎉 Party Rooms', url: 'https://staging.dial.wtf' }
-          ]
-        ]
+              ? {
+                  text: "🎉 Party Rooms",
+                  web_app: { url: "https://staging.dial.wtf" },
+                }
+              : { text: "🎉 Party Rooms", url: "https://staging.dial.wtf" },
+          ],
+        ],
       };
 
       // Send photo with caption and inline keyboard
       const logoUrl = `${baseUrl}/phone.logo.no.bg.png`;
-      const result = await tgCall('sendPhoto', {
+      const result = await tgCall("sendPhoto", {
         chat_id: chatId,
         photo: logoUrl,
         caption: message,
         reply_markup: keyboard,
-        parse_mode: 'Markdown'
+        parse_mode: "Markdown",
       });
 
       if (DEBUG && !result.ok) {
@@ -907,7 +1366,7 @@ export async function POST(req: NextRequest) {
     if (/^\/startparty\b/i.test(text)) {
       const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
       if (!apiKey) {
-        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        await reply("Server missing PUBLIC_API_KEY_TELEGRAM");
         return NextResponse.json({ ok: false }, { status: 200 });
       }
 
@@ -924,40 +1383,54 @@ export async function POST(req: NextRequest) {
         try {
           const privy = await getPrivyClient();
           if (privy) {
-            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
-            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            const user = await privy
+              .users()
+              .getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find(
+              (a: any) =>
+                a.type === "wallet" && typeof (a as any).address === "string"
+            );
             const addr = (w as any)?.address as string | undefined;
             if (addr && /^0x[0-9a-fA-F]{40}$/.test(addr)) owner = addr;
           }
         } catch (err: any) {
           if (DEBUG) {
-            await reply(`dbg: Privy lookup failed: ${err?.message || 'unknown'}`);
+            await reply(
+              `dbg: Privy lookup failed: ${err?.message || "unknown"}`
+            );
           }
         }
       }
 
       if (!owner) {
-        await reply('No wallet found. Usage: /startparty <your_wallet_address>\n\nExample: /startparty 0xaA64...337c');
+        await reply(
+          "No wallet found. Usage: /startparty <your_wallet_address>\n\nExample: /startparty 0xaA64...337c"
+        );
         return NextResponse.json({ ok: true });
       }
 
       try {
-        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines', {
-          method: 'POST',
-          headers: {
-            'x-api-key': apiKey,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            owner,
-            telegramUserId: String(tgUserId),
-            telegramChatId: String(chatId),
-          }),
-        });
+        const response = await fetch(
+          "https://staging.dial.wtf/api/v1/party-lines",
+          {
+            method: "POST",
+            headers: {
+              "x-api-key": apiKey,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              owner,
+              telegramUserId: String(tgUserId),
+              telegramChatId: String(chatId),
+            }),
+          }
+        );
 
         if (!response.ok) {
           const error = await response.text();
-          await reply(`Failed to create party room: ${response.status} ${response.statusText}`);
+          await reply(
+            `Failed to create party room: ${response.status} ${response.statusText}`
+          );
           return NextResponse.json({ ok: false, error });
         }
 
@@ -969,7 +1442,8 @@ export async function POST(req: NextRequest) {
         const data = apiResponse.data || apiResponse;
         const joinUrl = data.joinUrl;
         const roomCode = data.roomCode;
-        const partyId = data.id || data.partyLineId || data.contractAddress || data.address;
+        const partyId =
+          data.id || data.partyLineId || data.contractAddress || data.address;
 
         if (!joinUrl && !partyId) {
           await reply(`⚠️ Party room created but no ID or joinUrl returned.`);
@@ -978,16 +1452,22 @@ export async function POST(req: NextRequest) {
 
         // Replace dial.wtf with staging.dial.wtf in joinUrl
         const partyLineUrl = joinUrl
-          ? joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/')
+          ? joinUrl.replace("https://dial.wtf/", "https://staging.dial.wtf/")
           : `https://staging.dial.wtf/party/${roomCode || partyId}`;
-        const message = `🎉 Party room created!\n\nOwner: ${owner}\nRoom Code: ${roomCode || 'N/A'}`;
+        const message = `🎉 Party room created!\n\nOwner: ${owner}\nRoom Code: ${
+          roomCode || "N/A"
+        }`;
         const keyboard = {
-          inline_keyboard: [[{ text: 'Open Party Room', url: partyLineUrl }]]
+          inline_keyboard: [[{ text: "Open Party Room", url: partyLineUrl }]],
         };
-        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: message,
+          reply_markup: keyboard,
+        });
         return NextResponse.json({ ok: true, data: apiResponse });
       } catch (err: any) {
-        await reply(`Error creating party room: ${err?.message || 'unknown'}`);
+        await reply(`Error creating party room: ${err?.message || "unknown"}`);
         return NextResponse.json({ ok: false });
       }
     }
@@ -996,22 +1476,27 @@ export async function POST(req: NextRequest) {
     if (/^\/listparty\b/i.test(text)) {
       const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
       if (!apiKey) {
-        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        await reply("Server missing PUBLIC_API_KEY_TELEGRAM");
         return NextResponse.json({ ok: false }, { status: 200 });
       }
 
       try {
         // Query all party lines (not just active ones)
-        const response = await fetch('https://staging.dial.wtf/api/v1/party-lines?limit=100', {
-          method: 'GET',
-          headers: {
-            'x-api-key': apiKey,
-          },
-        });
+        const response = await fetch(
+          "https://staging.dial.wtf/api/v1/party-lines?limit=100",
+          {
+            method: "GET",
+            headers: {
+              "x-api-key": apiKey,
+            },
+          }
+        );
 
         if (!response.ok) {
           const error = await response.text();
-          await reply(`Failed to fetch party rooms: ${response.status} ${response.statusText}`);
+          await reply(
+            `Failed to fetch party rooms: ${response.status} ${response.statusText}`
+          );
           return NextResponse.json({ ok: false, error });
         }
 
@@ -1030,16 +1515,26 @@ export async function POST(req: NextRequest) {
         }
 
         if (partyLines.length === 0) {
-          await reply('No open party rooms found. Use /startparty to create one!');
+          await reply(
+            "No open party rooms found. Use /startparty to create one!"
+          );
           return NextResponse.json({ ok: true, data: [] });
         }
 
         let message = `🎊 Open Party Rooms (${partyLines.length}):\n\n`;
         partyLines.slice(0, 10).forEach((party: any, idx: number) => {
-          const roomCode = party.roomCode || 'N/A';
-          const owner = party.owner || 'Unknown';
-          const joinUrl = party.joinUrl ? party.joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/') : '';
-          message += `${idx + 1}. ${roomCode}\n   Owner: ${owner.slice(0, 10)}...${owner.slice(-6)}\n   ${joinUrl}\n\n`;
+          const roomCode = party.roomCode || "N/A";
+          const owner = party.owner || "Unknown";
+          const joinUrl = party.joinUrl
+            ? party.joinUrl.replace(
+                "https://dial.wtf/",
+                "https://staging.dial.wtf/"
+              )
+            : "";
+          message += `${idx + 1}. ${roomCode}\n   Owner: ${owner.slice(
+            0,
+            10
+          )}...${owner.slice(-6)}\n   ${joinUrl}\n\n`;
         });
 
         if (partyLines.length > 10) {
@@ -1049,7 +1544,7 @@ export async function POST(req: NextRequest) {
         await reply(message);
         return NextResponse.json({ ok: true, data: partyLines });
       } catch (err: any) {
-        await reply(`Error fetching party rooms: ${err?.message || 'unknown'}`);
+        await reply(`Error fetching party rooms: ${err?.message || "unknown"}`);
         return NextResponse.json({ ok: false });
       }
     }
@@ -1057,32 +1552,38 @@ export async function POST(req: NextRequest) {
     // /findparty <keyword> - Search for a party room by keyword (name, room code, owner, or contract address)
     if (/^\/findparty\b/i.test(text)) {
       const parts = text.split(/\s+/);
-      const searchQuery = parts.slice(1).join(' ').trim();
+      const searchQuery = parts.slice(1).join(" ").trim();
 
       if (!searchQuery) {
-        await reply('Usage: /findparty <keyword>\n\nSearch by party name, room code, owner address, or contract address');
+        await reply(
+          "Usage: /findparty <keyword>\n\nSearch by party name, room code, owner address, or contract address"
+        );
         return NextResponse.json({ ok: true });
       }
 
       const apiKey = process.env.PUBLIC_API_KEY_TELEGRAM;
       if (!apiKey) {
-        await reply('Server missing PUBLIC_API_KEY_TELEGRAM');
+        await reply("Server missing PUBLIC_API_KEY_TELEGRAM");
         return NextResponse.json({ ok: false }, { status: 200 });
       }
 
       try {
         // Use the API's search parameter for server-side filtering
-        const searchUrl = `https://staging.dial.wtf/api/v1/party-lines?search=${encodeURIComponent(searchQuery)}&isActive=true&limit=50`;
+        const searchUrl = `https://staging.dial.wtf/api/v1/party-lines?search=${encodeURIComponent(
+          searchQuery
+        )}&isActive=true&limit=50`;
         const response = await fetch(searchUrl, {
-          method: 'GET',
+          method: "GET",
           headers: {
-            'x-api-key': apiKey,
+            "x-api-key": apiKey,
           },
         });
 
         if (!response.ok) {
           const error = await response.text();
-          await reply(`Failed to search party rooms: ${response.status} ${response.statusText}`);
+          await reply(
+            `Failed to search party rooms: ${response.status} ${response.statusText}`
+          );
           return NextResponse.json({ ok: false, error });
         }
 
@@ -1090,22 +1591,35 @@ export async function POST(req: NextRequest) {
         const partyLines = apiResponse?.data?.partyLines || [];
 
         if (partyLines.length === 0) {
-          await reply(`No party rooms found matching: "${searchQuery}"\n\nTry searching by party name, room code, owner address, or contract address`);
+          await reply(
+            `No party rooms found matching: "${searchQuery}"\n\nTry searching by party name, room code, owner address, or contract address`
+          );
           return NextResponse.json({ ok: true, data: [] });
         }
 
-        let message = `🔍 Found ${partyLines.length} matching party room${partyLines.length > 1 ? 's' : ''}:\n\n`;
+        let message = `🔍 Found ${partyLines.length} matching party room${
+          partyLines.length > 1 ? "s" : ""
+        }:\n\n`;
         partyLines.slice(0, 5).forEach((party: any, idx: number) => {
-          const name = party.name || party.roomCode || 'Unnamed';
-          const roomCode = party.roomCode || 'N/A';
-          const owner = party.owner || 'Unknown';
-          const contractAddr = party.contractAddress || party.address || 'N/A';
-          const joinUrl = party.joinUrl ? party.joinUrl.replace('https://dial.wtf/', 'https://staging.dial.wtf/') : '';
-          
+          const name = party.name || party.roomCode || "Unnamed";
+          const roomCode = party.roomCode || "N/A";
+          const owner = party.owner || "Unknown";
+          const contractAddr = party.contractAddress || party.address || "N/A";
+          const joinUrl = party.joinUrl
+            ? party.joinUrl.replace(
+                "https://dial.wtf/",
+                "https://staging.dial.wtf/"
+              )
+            : "";
+
           message += `${idx + 1}. ${name}\n`;
           if (party.name && party.roomCode) message += `   Code: ${roomCode}\n`;
           message += `   Owner: ${owner.slice(0, 10)}...${owner.slice(-6)}\n`;
-          if (contractAddr !== 'N/A') message += `   Contract: ${contractAddr.slice(0, 10)}...${contractAddr.slice(-6)}\n`;
+          if (contractAddr !== "N/A")
+            message += `   Contract: ${contractAddr.slice(
+              0,
+              10
+            )}...${contractAddr.slice(-6)}\n`;
           message += `   ${joinUrl}\n\n`;
         });
 
@@ -1116,7 +1630,9 @@ export async function POST(req: NextRequest) {
         await reply(message);
         return NextResponse.json({ ok: true, data: partyLines });
       } catch (err: any) {
-        await reply(`Error searching party rooms: ${err?.message || 'unknown'}`);
+        await reply(
+          `Error searching party rooms: ${err?.message || "unknown"}`
+        );
         return NextResponse.json({ ok: false });
       }
     }
@@ -1124,18 +1640,32 @@ export async function POST(req: NextRequest) {
     // /invoice <amount> <asset> [description] - Create crypto invoice
     if (/^\/invoice\b/i.test(text)) {
       const parts = text.split(/\s+/);
-      const amount = parseFloat(parts[1] || '0');
-      const asset = (parts[2] || 'USDC').toUpperCase();
-      const description = parts.slice(3).join(' ') || undefined;
+      const amount = parseFloat(parts[1] || "0");
+      const asset = (parts[2] || "USDC").toUpperCase();
+      const description = parts.slice(3).join(" ") || undefined;
 
       if (!amount || amount <= 0) {
-        await reply('Usage: /invoice <amount> <asset> [description]\n\nExample: /invoice 10 USDC Payment for service\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        await reply(
+          "Usage: /invoice <amount> <asset> [description]\n\nExample: /invoice 10 USDC Payment for service\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL"
+        );
         return NextResponse.json({ ok: true });
       }
 
-      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      const validAssets = [
+        "USDT",
+        "USDC",
+        "ETH",
+        "BTC",
+        "TON",
+        "BNB",
+        "TRX",
+        "LTC",
+        "SOL",
+      ];
       if (!validAssets.includes(asset)) {
-        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        await reply(
+          `Invalid asset: ${asset}\n\nSupported: ${validAssets.join(", ")}`
+        );
         return NextResponse.json({ ok: true });
       }
 
@@ -1144,24 +1674,31 @@ export async function POST(req: NextRequest) {
         try {
           const privy = await getPrivyClient();
           if (privy) {
-            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
-            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            const user = await privy
+              .users()
+              .getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find(
+              (a: any) =>
+                a.type === "wallet" && typeof (a as any).address === "string"
+            );
             payee = (w as any)?.address as string | undefined;
           }
         } catch {}
 
         if (!payee) {
           const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-          await reply('No wallet connected. Open the app to connect your wallet first.');
+          await reply(
+            "No wallet connected. Open the app to connect your wallet first."
+          );
           return NextResponse.json({ ok: true });
         }
 
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const res = await fetch(`${baseUrl}/api/crypto/invoice`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            currency_type: 'crypto',
+            currency_type: "crypto",
             asset,
             amount: String(amount),
             description,
@@ -1172,25 +1709,41 @@ export async function POST(req: NextRequest) {
 
         const data = await res.json();
         if (!data.ok || !data.result) {
-          await reply(`Failed to create invoice: ${data.error || 'unknown error'}`);
+          await reply(
+            `Failed to create invoice: ${data.error || "unknown error"}`
+          );
           return NextResponse.json({ ok: false });
         }
 
         const invoice = data.result;
-        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
-        const emoji = assetEmojis[asset] || '💰';
-        const message = `${emoji} Invoice Created\n\nAmount: ${amount} ${asset}\n${description ? `Description: ${description}\n` : ''}Status: Active`;
-        
+        const assetEmojis: any = {
+          USDT: "💵",
+          USDC: "💵",
+          ETH: "Ξ",
+          BTC: "₿",
+          TON: "💎",
+          BNB: "🔶",
+          SOL: "◎",
+          TRX: "🔺",
+          LTC: "Ł",
+        };
+        const emoji = assetEmojis[asset] || "💰";
+        const message = `${emoji} Invoice Created\n\nAmount: ${amount} ${asset}\n${
+          description ? `Description: ${description}\n` : ""
+        }Status: Active`;
+
         const keyboard = {
-          inline_keyboard: [[
-            { text: 'Pay Invoice', url: invoice.pay_url }
-          ]]
+          inline_keyboard: [[{ text: "Pay Invoice", url: invoice.pay_url }]],
         };
 
-        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: message,
+          reply_markup: keyboard,
+        });
         return NextResponse.json({ ok: true, result: invoice });
       } catch (err: any) {
-        await reply(`Error creating invoice: ${err?.message || 'unknown'}`);
+        await reply(`Error creating invoice: ${err?.message || "unknown"}`);
         return NextResponse.json({ ok: false });
       }
     }
@@ -1199,34 +1752,52 @@ export async function POST(req: NextRequest) {
     if (/^\/send\b/i.test(text)) {
       const parts = text.split(/\s+/);
       const userTarget = parts[1];
-      const amount = parseFloat(parts[2] || '0');
-      const asset = (parts[3] || 'USDC').toUpperCase();
-      const comment = parts.slice(4).join(' ') || undefined;
+      const amount = parseFloat(parts[2] || "0");
+      const asset = (parts[3] || "USDC").toUpperCase();
+      const comment = parts.slice(4).join(" ") || undefined;
 
       if (!userTarget || !amount || amount <= 0) {
-        await reply('Usage: /send <user_id|@username> <amount> <asset> [comment]\n\nExample: /send @john 5 USDC Thanks!\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        await reply(
+          "Usage: /send <user_id|@username> <amount> <asset> [comment]\n\nExample: /send @john 5 USDC Thanks!\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL"
+        );
         return NextResponse.json({ ok: true });
       }
 
-      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      const validAssets = [
+        "USDT",
+        "USDC",
+        "ETH",
+        "BTC",
+        "TON",
+        "BNB",
+        "TRX",
+        "LTC",
+        "SOL",
+      ];
       if (!validAssets.includes(asset)) {
-        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        await reply(
+          `Invalid asset: ${asset}\n\nSupported: ${validAssets.join(", ")}`
+        );
         return NextResponse.json({ ok: true });
       }
 
-      const targetUserId = userTarget.startsWith('@') ? null : parseInt(userTarget);
-      if (!targetUserId && !userTarget.startsWith('@')) {
-        await reply('Invalid user. Use user ID or @username');
+      const targetUserId = userTarget.startsWith("@")
+        ? null
+        : parseInt(userTarget);
+      if (!targetUserId && !userTarget.startsWith("@")) {
+        await reply("Invalid user. Use user ID or @username");
         return NextResponse.json({ ok: true });
       }
 
       try {
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-        const spendId = `spend_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
-        
+        const spendId = `spend_${Date.now()}_${Math.random()
+          .toString(36)
+          .substring(2, 15)}`;
+
         const res = await fetch(`${baseUrl}/api/crypto/transfer`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             user_id: targetUserId || 0,
             asset,
@@ -1238,17 +1809,31 @@ export async function POST(req: NextRequest) {
 
         const data = await res.json();
         if (!data.ok || !data.result) {
-          await reply(`Failed to send: ${data.error || 'unknown error'}`);
+          await reply(`Failed to send: ${data.error || "unknown error"}`);
           return NextResponse.json({ ok: false });
         }
 
         const transfer = data.result;
-        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
-        const emoji = assetEmojis[asset] || '💰';
-        await reply(`✅ ${emoji} Sent ${amount} ${asset} to ${userTarget}${comment ? `\n\n"${comment}"` : ''}`);
+        const assetEmojis: any = {
+          USDT: "💵",
+          USDC: "💵",
+          ETH: "Ξ",
+          BTC: "₿",
+          TON: "💎",
+          BNB: "🔶",
+          SOL: "◎",
+          TRX: "🔺",
+          LTC: "Ł",
+        };
+        const emoji = assetEmojis[asset] || "💰";
+        await reply(
+          `✅ ${emoji} Sent ${amount} ${asset} to ${userTarget}${
+            comment ? `\n\n"${comment}"` : ""
+          }`
+        );
         return NextResponse.json({ ok: true, result: transfer });
       } catch (err: any) {
-        await reply(`Error sending: ${err?.message || 'unknown'}`);
+        await reply(`Error sending: ${err?.message || "unknown"}`);
         return NextResponse.json({ ok: false });
       }
     }
@@ -1256,27 +1841,41 @@ export async function POST(req: NextRequest) {
     // /check <amount> <asset> [pin_to_user] - Create crypto voucher
     if (/^\/check\b/i.test(text)) {
       const parts = text.split(/\s+/);
-      const amount = parseFloat(parts[1] || '0');
-      const asset = (parts[2] || 'USDC').toUpperCase();
+      const amount = parseFloat(parts[1] || "0");
+      const asset = (parts[2] || "USDC").toUpperCase();
       const pinTo = parts[3];
 
       if (!amount || amount <= 0) {
-        await reply('Usage: /check <amount> <asset> [pin_to_user]\n\nExample: /check 10 USDC @john\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL');
+        await reply(
+          "Usage: /check <amount> <asset> [pin_to_user]\n\nExample: /check 10 USDC @john\n\nAssets: USDT, USDC, ETH, BTC, TON, BNB, SOL"
+        );
         return NextResponse.json({ ok: true });
       }
 
-      const validAssets = ['USDT', 'USDC', 'ETH', 'BTC', 'TON', 'BNB', 'TRX', 'LTC', 'SOL'];
+      const validAssets = [
+        "USDT",
+        "USDC",
+        "ETH",
+        "BTC",
+        "TON",
+        "BNB",
+        "TRX",
+        "LTC",
+        "SOL",
+      ];
       if (!validAssets.includes(asset)) {
-        await reply(`Invalid asset: ${asset}\n\nSupported: ${validAssets.join(', ')}`);
+        await reply(
+          `Invalid asset: ${asset}\n\nSupported: ${validAssets.join(", ")}`
+        );
         return NextResponse.json({ ok: true });
       }
 
       try {
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
         const payload: any = { asset, amount: String(amount) };
-        
+
         if (pinTo) {
-          if (pinTo.startsWith('@')) {
+          if (pinTo.startsWith("@")) {
             payload.pin_to_username = pinTo.substring(1);
           } else {
             payload.pin_to_user_id = parseInt(pinTo);
@@ -1284,32 +1883,48 @@ export async function POST(req: NextRequest) {
         }
 
         const res = await fetch(`${baseUrl}/api/crypto/check`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
 
         const data = await res.json();
         if (!data.ok || !data.result) {
-          await reply(`Failed to create check: ${data.error || 'unknown error'}`);
+          await reply(
+            `Failed to create check: ${data.error || "unknown error"}`
+          );
           return NextResponse.json({ ok: false });
         }
 
         const check = data.result;
-        const assetEmojis: any = { USDT: '💵', USDC: '💵', ETH: 'Ξ', BTC: '₿', TON: '💎', BNB: '🔶', SOL: '◎', TRX: '🔺', LTC: 'Ł' };
-        const emoji = assetEmojis[asset] || '💰';
-        const message = `🎁 ${emoji} Crypto Check Created\n\nAmount: ${amount} ${asset}\n${pinTo ? `Pinned to: ${pinTo}\n` : ''}Status: Active`;
-        
+        const assetEmojis: any = {
+          USDT: "💵",
+          USDC: "💵",
+          ETH: "Ξ",
+          BTC: "₿",
+          TON: "💎",
+          BNB: "🔶",
+          SOL: "◎",
+          TRX: "🔺",
+          LTC: "Ł",
+        };
+        const emoji = assetEmojis[asset] || "💰";
+        const message = `🎁 ${emoji} Crypto Check Created\n\nAmount: ${amount} ${asset}\n${
+          pinTo ? `Pinned to: ${pinTo}\n` : ""
+        }Status: Active`;
+
         const keyboard = {
-          inline_keyboard: [[
-            { text: 'Claim Check', url: check.check_url }
-          ]]
+          inline_keyboard: [[{ text: "Claim Check", url: check.check_url }]],
         };
 
-        await tgCall('sendMessage', { chat_id: chatId, text: message, reply_markup: keyboard });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: message,
+          reply_markup: keyboard,
+        });
         return NextResponse.json({ ok: true, result: check });
       } catch (err: any) {
-        await reply(`Error creating check: ${err?.message || 'unknown'}`);
+        await reply(`Error creating check: ${err?.message || "unknown"}`);
         return NextResponse.json({ ok: false });
       }
     }
@@ -1321,21 +1936,35 @@ export async function POST(req: NextRequest) {
         try {
           const privy = await getPrivyClient();
           if (privy) {
-            const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
-            const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+            const user = await privy
+              .users()
+              .getByTelegramUserID({ telegram_user_id: tgUserId });
+            const w = (user.linked_accounts || []).find(
+              (a: any) =>
+                a.type === "wallet" && typeof (a as any).address === "string"
+            );
             walletAddr = (w as any)?.address as string | undefined;
           }
         } catch {}
 
         if (!walletAddr) {
-          await reply('No wallet connected. Open the app to connect your wallet first.');
+          await reply(
+            "No wallet connected. Open the app to connect your wallet first."
+          );
           return NextResponse.json({ ok: true });
         }
 
-        await reply(`💰 Your Wallet\n\nAddress: ${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}\n\nConnect your wallet in the app to view balances and manage crypto payments.`);
+        await reply(
+          `💰 Your Wallet\n\nAddress: ${walletAddr.slice(
+            0,
+            6
+          )}...${walletAddr.slice(
+            -4
+          )}\n\nConnect your wallet in the app to view balances and manage crypto payments.`
+        );
         return NextResponse.json({ ok: true });
       } catch (err: any) {
-        await reply(`Error: ${err?.message || 'unknown'}`);
+        await reply(`Error: ${err?.message || "unknown"}`);
         return NextResponse.json({ ok: false });
       }
     }
@@ -1344,23 +1973,34 @@ export async function POST(req: NextRequest) {
 
     // /ai <url> - Download model from HuggingFace
     if (/^\/ai\s+https?:\/\//i.test(text)) {
-      const { handleAiDownloadCommand } = await import('@/lib/bot/ai-commands');
-      const url = text.split(/\s+/).slice(1).join(' ');
+      const { handleAiDownloadCommand } = await import("@/lib/bot/ai-commands");
+      const url = text.split(/\s+/).slice(1).join(" ");
       const message = await handleAiDownloadCommand(url);
-      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: message,
+        parse_mode: "Markdown",
+      });
 
       // Trigger background download directly (no internal HTTP)
       try {
         (async () => {
           try {
-            const { addModelFromHuggingFace } = await import('@/lib/ai-model-manager');
-            await addModelFromHuggingFace({ huggingFaceUrl: url, createTorrent: false });
+            const { addModelFromHuggingFace } = await import(
+              "@/lib/ai-model-manager"
+            );
+            await addModelFromHuggingFace({
+              huggingFaceUrl: url,
+              createTorrent: false,
+            });
           } catch (e) {
-            try { console.error('[Bot] AI download error:', e); } catch {}
+            try {
+              console.error("[Bot] AI download error:", e);
+            } catch {}
           }
         })();
       } catch (err) {
-        console.error('[Bot] Failed to trigger download:', err);
+        console.error("[Bot] Failed to trigger download:", err);
       }
 
       return NextResponse.json({ ok: true });
@@ -1368,45 +2008,77 @@ export async function POST(req: NextRequest) {
 
     // /ai-list, /ai_list, or /ailist - List downloaded models
     if (/^\/ai[-_]?list\b/i.test(text)) {
-      const { handleAiListCommand } = await import('@/lib/bot/ai-commands');
+      const { handleAiListCommand } = await import("@/lib/bot/ai-commands");
       const message = handleAiListCommand();
-      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: message,
+        parse_mode: "Markdown",
+      });
       return NextResponse.json({ ok: true });
     }
 
     // /ai-serve, /ai_serve, or /aiserve <model_id> - Start serving a model
     if (/^\/ai[-_]?serve\b/i.test(text)) {
-      const { handleAiServeCommand, getServeSelectionKeyboard } = await import('@/lib/bot/ai-commands');
+      const { handleAiServeCommand, getServeSelectionKeyboard } = await import(
+        "@/lib/bot/ai-commands"
+      );
       const parts = text.split(/\s+/);
       const modelId = parts[1];
       const message = handleAiServeCommand(modelId);
 
       if (!modelId) {
         const keyboard = getServeSelectionKeyboard();
-        await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown', reply_markup: keyboard });
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: message,
+          parse_mode: "Markdown",
+          reply_markup: keyboard,
+        });
         return NextResponse.json({ ok: true });
       }
 
-      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: message,
+        parse_mode: "Markdown",
+      });
 
       // Federated serving policy: if a remote peer is already serving this model code, don't start locally.
       try {
-        const { getModelById } = await import('@/lib/ai-model-storage');
+        const { getModelById } = await import("@/lib/ai-model-storage");
         const m = getModelById(modelId);
         if (m) {
           const serverBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-          const norm = (u: string) => u.replace(/\/$/, '').toLowerCase();
+          const norm = (u: string) => u.replace(/\/$/, "").toLowerCase();
           const isSelf = (u: string) => norm(u) === norm(serverBase);
-          const { listAggregated } = await import('@/lib/swarm-client');
-          const { createHash } = await import('crypto');
+          const { listAggregated } = await import("@/lib/swarm-client");
+          const { createHash } = await import("crypto");
           const code = m.infoHash
-            ? String(m.infoHash).slice(0,7).toLowerCase()
-            : createHash('sha1').update(m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id).digest('hex').slice(0,7).toLowerCase();
-          const aggregated = await listAggregated(serverBase).catch(() => [] as any[]);
-          const entry = aggregated.find((e: any) => String(e.code).toLowerCase() === code);
-          const remoteServing = entry?.examples?.find((ex: any) => ex.status === 'serving' && ex.publicUrl && !isSelf(ex.publicUrl));
+            ? String(m.infoHash).slice(0, 7).toLowerCase()
+            : createHash("sha1")
+                .update(
+                  m.repoId && m.fileName ? `${m.repoId}::${m.fileName}` : m.id
+                )
+                .digest("hex")
+                .slice(0, 7)
+                .toLowerCase();
+          const aggregated = await listAggregated(serverBase).catch(
+            () => [] as any[]
+          );
+          const entry = aggregated.find(
+            (e: any) => String(e.code).toLowerCase() === code
+          );
+          const remoteServing = entry?.examples?.find(
+            (ex: any) =>
+              ex.status === "serving" && ex.publicUrl && !isSelf(ex.publicUrl)
+          );
           if (remoteServing) {
-            await tgCall('sendMessage', { chat_id: chatId, text: `🤝 A peer is already serving this model (code: \`${code}\`).\n\nSkipping local server to federate. Use \`/ask <message> #${code}\` or just \`/ask ...\` to auto-route.`, parse_mode: 'Markdown' });
+            await tgCall("sendMessage", {
+              chat_id: chatId,
+              text: `🤝 A peer is already serving this model (code: \`${code}\`).\n\nSkipping local server to federate. Use \`/ask <message> #${code}\` or just \`/ask ...\` to auto-route.`,
+              parse_mode: "Markdown",
+            });
             return NextResponse.json({ ok: true });
           }
         }
@@ -1414,21 +2086,23 @@ export async function POST(req: NextRequest) {
 
       // Start serving directly and open chat session (no remote peer serving)
       try {
-        const { startModelServer } = await import('@/lib/ai-inference');
+        const { startModelServer } = await import("@/lib/ai-inference");
         await startModelServer({ modelId });
-        const { getChatSession } = await import('@/lib/ai-chat-session');
+        const { getChatSession } = await import("@/lib/ai-chat-session");
         getChatSession(tgUserId, chatId, modelId);
-        await tgCall('sendMessage', {
+        await tgCall("sendMessage", {
           chat_id: chatId,
           text: `🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend me a message to chat with the AI.\n\nUse \`/ai-clear\` to end the session.`,
-          parse_mode: 'Markdown',
+          parse_mode: "Markdown",
         });
       } catch (err: any) {
-        console.error('[Bot] Failed to start serving/chat:', err);
-        await tgCall('sendMessage', {
+        console.error("[Bot] Failed to start serving/chat:", err);
+        await tgCall("sendMessage", {
           chat_id: chatId,
-          text: `❌ *Failed to start model server*\n\n${err?.message || 'unknown error'}\n\nCheck:\n• Model file exists and is GGUF\n• LLAMA_SERVER_BIN is set in .env\n• Binary is executable`,
-          parse_mode: 'Markdown',
+          text: `❌ *Failed to start model server*\n\n${
+            err?.message || "unknown error"
+          }\n\nCheck:\n• Model file exists and is GGUF\n• LLAMA_SERVER_BIN is set in .env\n• Binary is executable`,
+          parse_mode: "Markdown",
         });
       }
 
@@ -1440,26 +2114,34 @@ export async function POST(req: NextRequest) {
       const parts = text.split(/\s+/);
       const modelId = parts[1];
       if (!modelId) {
-        await reply('Usage: /ai-chat <model_id>\n\nUse /ai-list to see available models.');
+        await reply(
+          "Usage: /ai-chat <model_id>\n\nUse /ai-list to see available models."
+        );
         return NextResponse.json({ ok: true });
       }
       try {
-        const { getModelById, getServeStatus } = await import('@/lib/ai-model-storage');
+        const { getModelById, getServeStatus } = await import(
+          "@/lib/ai-model-storage"
+        );
         const model = getModelById(modelId);
         if (!model) {
-          await reply('❌ Model not found. Use /ai-list to see models.');
+          await reply("❌ Model not found. Use /ai-list to see models.");
           return NextResponse.json({ ok: true });
         }
         const status = getServeStatus(modelId);
         if (!status?.isServing) {
-          await reply('❌ Model is not serving. Start it with /ai-serve <model_id> or use /ai.');
+          await reply(
+            "❌ Model is not serving. Start it with /ai-serve <model_id> or use /ai."
+          );
           return NextResponse.json({ ok: true });
         }
-        const { getChatSession } = await import('@/lib/ai-chat-session');
+        const { getChatSession } = await import("@/lib/ai-chat-session");
         getChatSession(tgUserId, chatId, modelId);
-        await reply(`🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend a message to chat.\nUse \`/ai-clear\` to end the session.`);
+        await reply(
+          `🤖 *Chat Session Started*\n\nModel: \`${modelId}\`\n\nSend a message to chat.\nUse \`/ai-clear\` to end the session.`
+        );
       } catch (err: any) {
-        await reply(`Error: ${err?.message || 'unknown'}`);
+        await reply(`Error: ${err?.message || "unknown"}`);
       }
       return NextResponse.json({ ok: true });
     }
@@ -1470,14 +2152,16 @@ export async function POST(req: NextRequest) {
       const modelId = parts[1];
 
       if (!modelId) {
-        await reply('Usage: /ai-stop <model_id>\n\nUse /ai-list to see serving models.');
+        await reply(
+          "Usage: /ai-stop <model_id>\n\nUse /ai-list to see serving models."
+        );
         return NextResponse.json({ ok: true });
       }
 
       try {
         const apiBase = req.nextUrl.origin;
         const res = await fetch(`${apiBase}/api/ai/serve?modelId=${modelId}`, {
-          method: 'DELETE',
+          method: "DELETE",
         });
 
         if (res.ok) {
@@ -1486,7 +2170,7 @@ export async function POST(req: NextRequest) {
           await reply(`❌ Failed to stop model: ${await res.text()}`);
         }
       } catch (err: any) {
-        await reply(`Error: ${err?.message || 'unknown'}`);
+        await reply(`Error: ${err?.message || "unknown"}`);
       }
 
       return NextResponse.json({ ok: true });
@@ -1494,9 +2178,13 @@ export async function POST(req: NextRequest) {
 
     // /ai-help, /ai_help, or /aihelp - AI commands help
     if (/^\/ai[-_]?help\b/i.test(text)) {
-      const { getAiHelpMessage } = await import('@/lib/bot/ai-commands');
+      const { getAiHelpMessage } = await import("@/lib/bot/ai-commands");
       const message = getAiHelpMessage();
-      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown' });
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: message,
+        parse_mode: "Markdown",
+      });
       return NextResponse.json({ ok: true });
     }
 
@@ -1504,62 +2192,102 @@ export async function POST(req: NextRequest) {
     if (/^\/ai[-_]?setup\b$/i.test(text)) {
       const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
       const macPkgUrl = process.env.MAC_INSTALLER_URL; // Signed & notarized PKG
-      const message = (
+      const message =
         `🛠️ *One-Click Installer*\n\n` +
         `Tap your OS to download the installer. Then double-click it to run.\n\n` +
         `This will:\n` +
         `• Install Node deps\n` +
         `• Build llama-server locally\n` +
         `• Configure .env for AI\n` +
-        (macPkgUrl ? `\n✅ macOS link is signed & notarized to avoid Gatekeeper warnings.` : `\n⚠️ macOS .command may need right-click → Open on first run.`)
-      );
+        (macPkgUrl
+          ? `\n✅ macOS link is signed & notarized to avoid Gatekeeper warnings.`
+          : `\n⚠️ macOS .command may need right-click → Open on first run.`);
       const rows: any[] = [];
       // Quick confirm button
-      rows.push([{ text: '✅ I ran the installer', callback_data: 'ai_setup_done' }]);
+      rows.push([
+        { text: "✅ I ran the installer", callback_data: "ai_setup_done" },
+      ]);
       // macOS copy page (simplest path for users to copy command)
-      rows.push([{ text: '🧩 macOS: Copy Command Page', url: `${baseUrl}/ai/setup/mac` }]);
+      rows.push([
+        { text: "🧩 macOS: Copy Command Page", url: `${baseUrl}/ai/setup/mac` },
+      ]);
       if (macPkgUrl) {
-        rows.push([{ text: '⬇️ macOS Installer (Signed PKG)', url: macPkgUrl }]);
+        rows.push([
+          { text: "⬇️ macOS Installer (Signed PKG)", url: macPkgUrl },
+        ]);
       } else {
-        rows.push([{ text: '⬇️ macOS Installer (.command)', url: `${baseUrl}/api/ai/setup/download/mac` }]);
+        rows.push([
+          {
+            text: "⬇️ macOS Installer (.command)",
+            url: `${baseUrl}/api/ai/setup/download/mac`,
+          },
+        ]);
       }
-      rows.push([{ text: '⬇️ Linux Installer (.sh)', url: `${baseUrl}/api/ai/setup/download/linux` }]);
-      rows.push([{ text: '⬇️ Linux GPU Installer (.sh)', url: `${baseUrl}/api/ai/setup/download/linux-gpu` }]);
+      rows.push([
+        {
+          text: "⬇️ Linux Installer (.sh)",
+          url: `${baseUrl}/api/ai/setup/download/linux`,
+        },
+      ]);
+      rows.push([
+        {
+          text: "⬇️ Linux GPU Installer (.sh)",
+          url: `${baseUrl}/api/ai/setup/download/linux-gpu`,
+        },
+      ]);
 
       const keyboard = { inline_keyboard: rows } as any;
-      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown', reply_markup: keyboard });
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: message,
+        parse_mode: "Markdown",
+        reply_markup: keyboard,
+      });
 
       // Also include the raw curl command for quick copy inside Telegram
       const curlCmd = `curl -fsSL ${baseUrl}/api/ai/setup/script | bash -s -- --auto`;
       const copyMsg = `macOS quick command:\n\n\`\`\`bash\n${curlCmd}\n\`\`\`\n\nAfter you run it, tap "I ran the installer" above.`;
-      await tgCall('sendMessage', { chat_id: chatId, text: copyMsg, parse_mode: 'Markdown' });
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: copyMsg,
+        parse_mode: "Markdown",
+      });
       return NextResponse.json({ ok: true });
     }
 
     // /ai-setup-gpu, /ai_setup_gpu, or /aisetupgpu - Highlight Linux GPU installer
     if (/^\/ai[-_]?setup[-_]?gpu\b$/i.test(text)) {
       const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-      const message = (
+      const message =
         `🛠️ *One-Click GPU Installer (Linux CUDA)*\n\n` +
-        `Tap to download, then double-click to run. If CUDA build fails, it falls back to CPU.\n`
-      );
+        `Tap to download, then double-click to run. If CUDA build fails, it falls back to CPU.\n`;
       const keyboard = {
         inline_keyboard: [
-          [{ text: '⬇️ Linux GPU Installer (.sh)', url: `${baseUrl}/api/ai/setup/download/linux-gpu` }],
+          [
+            {
+              text: "⬇️ Linux GPU Installer (.sh)",
+              url: `${baseUrl}/api/ai/setup/download/linux-gpu`,
+            },
+          ],
         ],
       } as any;
-      await tgCall('sendMessage', { chat_id: chatId, text: message, parse_mode: 'Markdown', reply_markup: keyboard });
+      await tgCall("sendMessage", {
+        chat_id: chatId,
+        text: message,
+        parse_mode: "Markdown",
+        reply_markup: keyboard,
+      });
       return NextResponse.json({ ok: true });
     }
 
     // /ai - Chat with AI (show model selection or continue conversation)
     if (/^\/ai(?:@\S+)?\s*$/i.test(text)) {
-      const { handleAiChatCommand } = await import('@/lib/bot/ai-commands');
+      const { handleAiChatCommand } = await import("@/lib/bot/ai-commands");
       const { message, keyboard } = handleAiChatCommand();
-      await tgCall('sendMessage', {
+      await tgCall("sendMessage", {
         chat_id: chatId,
         text: message,
-        parse_mode: 'Markdown',
+        parse_mode: "Markdown",
         reply_markup: keyboard,
       });
       return NextResponse.json({ ok: true });
@@ -1567,15 +2295,18 @@ export async function POST(req: NextRequest) {
 
     // /ai-clear, /ai_clear, or /aiclear - Clear chat session
     if (/^\/ai[-_]?clear\b/i.test(text)) {
-      const { clearSession } = await import('@/lib/ai-chat-session');
+      const { clearSession } = await import("@/lib/ai-chat-session");
       clearSession(tgUserId, chatId);
-      await reply('🗑️ Chat session cleared. Use /ai to start a new conversation.');
+      await reply(
+        "🗑️ Chat session cleared. Use /ai to start a new conversation."
+      );
       return NextResponse.json({ ok: true });
     }
 
     // Handle AI chat in private messages (if session is active)
-    if (chatType === 'private' && !isCommand) {
-      const { getActiveSession, addMessageToSession, getSessionMessages } = await import('@/lib/ai-chat-session');
+    if (chatType === "private" && !isCommand) {
+      const { getActiveSession, addMessageToSession, getSessionMessages } =
+        await import("@/lib/ai-chat-session");
       const session = getActiveSession(tgUserId, chatId);
 
       if (session) {
@@ -1583,7 +2314,7 @@ export async function POST(req: NextRequest) {
         try {
           // Add user message to session
           addMessageToSession(tgUserId, chatId, {
-            role: 'user',
+            role: "user",
             content: text,
           });
 
@@ -1593,8 +2324,8 @@ export async function POST(req: NextRequest) {
           // Send to AI
           const apiBase = req.nextUrl.origin;
           const res = await fetch(`${apiBase}/api/ai/chat`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               modelId: session.modelId,
               messages,
@@ -1604,16 +2335,18 @@ export async function POST(req: NextRequest) {
           });
 
           if (!res.ok) {
-            await reply(`❌ AI error: ${await res.text()}\n\nUse /ai-clear to start over.`);
+            await reply(
+              `❌ AI error: ${await res.text()}\n\nUse /ai-clear to start over.`
+            );
             return NextResponse.json({ ok: true });
           }
 
           const data = await res.json();
-          const aiResponse = data.result?.content || 'No response';
+          const aiResponse = data.result?.content || "No response";
 
           // Add AI response to session
           addMessageToSession(tgUserId, chatId, {
-            role: 'assistant',
+            role: "assistant",
             content: aiResponse,
           });
 
@@ -1621,8 +2354,10 @@ export async function POST(req: NextRequest) {
           await reply(aiResponse);
           return NextResponse.json({ ok: true });
         } catch (err: any) {
-          console.error('[Bot] AI chat error:', err);
-          await reply(`Error: ${err?.message || 'unknown'}\n\nUse /ai-clear to reset.`);
+          console.error("[Bot] AI chat error:", err);
+          await reply(
+            `Error: ${err?.message || "unknown"}\n\nUse /ai-clear to reset.`
+          );
           return NextResponse.json({ ok: true });
         }
       }
@@ -1638,7 +2373,7 @@ export async function POST(req: NextRequest) {
         if (DEBUG) {
           await reply(`dbg: parse failed. raw="${text}"`);
         }
-        await reply('Usage: /request <amount> [note] [destination]');
+        await reply("Usage: /request <amount> [note] [destination]");
         return NextResponse.json({ ok: true });
       }
 
@@ -1654,14 +2389,22 @@ export async function POST(req: NextRequest) {
           try {
             const privy = await getPrivyClient();
             if (privy) {
-              const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
-              const w = (user.linked_accounts || []).find((a: any) => a.type === 'wallet' && typeof (a as any).address === 'string');
+              const user = await privy
+                .users()
+                .getByTelegramUserID({ telegram_user_id: tgUserId });
+              const w = (user.linked_accounts || []).find(
+                (a: any) =>
+                  a.type === "wallet" && typeof (a as any).address === "string"
+              );
               const addr = (w as any)?.address as string | undefined;
               if (addr && isValidEthereumAddress(addr)) payee = addr;
               else if ((w as any)?.id) {
                 try {
                   const walletId = (w as any).id as string;
-                  const details = await (privy as any).wallets().ethereum().get(walletId);
+                  const details = await (privy as any)
+                    .wallets()
+                    .ethereum()
+                    .get(walletId);
                   const a = details?.address as string | undefined;
                   if (a && isValidEthereumAddress(a)) payee = a;
                 } catch {}
@@ -1669,50 +2412,95 @@ export async function POST(req: NextRequest) {
             }
           } catch {}
         }
-        if (!payee) payee = (process.env.PAYEE_ADDR as string | undefined) || appConfig.payeeAddr || undefined;
+        if (!payee)
+          payee =
+            (process.env.PAYEE_ADDR as string | undefined) ||
+            appConfig.payeeAddr ||
+            undefined;
         if (!payee) {
           const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
-          const keyboard = { inline_keyboard: [[{ text: 'Open app to link wallet', web_app: { url: baseUrl } }]] } as any;
+          const keyboard = {
+            inline_keyboard: [
+              [{ text: "Open app to link wallet", web_app: { url: baseUrl } }],
+            ],
+          } as any;
           pendingAddressByUser.set(tgUserId, { amount: amt, note });
-          const combinedText = 'No wallet linked. Open the app and sign in first, then retry /request.\n\nAlternatively, reply to this message with your receiving address or ENS.';
-          await tgCall('sendMessage', { chat_id: chatId, text: combinedText, reply_markup: keyboard });
+          const combinedText =
+            "No wallet linked. Open the app and sign in first, then retry /request.\n\nAlternatively, reply to this message with your receiving address or ENS.";
+          await tgCall("sendMessage", {
+            chat_id: chatId,
+            text: combinedText,
+            reply_markup: keyboard,
+          });
           return NextResponse.json({ ok: true });
         }
 
         let rest: Response;
         try {
           if (DEBUG) {
-            try { console.log('[BOT]/request -> POST', `${apiBase}/api/invoice`, { payee, amount: Number(amt), note }); } catch {}
+            try {
+              console.log("[BOT]/request -> POST", `${apiBase}/api/invoice`, {
+                payee,
+                amount: Number(amt),
+                note,
+              });
+            } catch {}
           }
           rest = await fetch(`${apiBase}/api/invoice`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json', 'Accept': 'application/json',
-            'x-internal': process.env.INTERNAL_API_KEY || '',
-          },
-          body: JSON.stringify({
-            payee,
-            amount: Number(amt),
-            note,
-            kind: 'request',
-            initData: '',
-          }),
-        });
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json",
+              "x-internal": process.env.INTERNAL_API_KEY || "",
+            },
+            body: JSON.stringify({
+              payee,
+              amount: Number(amt),
+              note,
+              kind: "request",
+              initData: "",
+            }),
+          });
         } catch (err: any) {
-          if (DEBUG) { try { console.warn('[BOT]/request fetch /api/invoice failed:', err?.message || err); } catch {} }
+          if (DEBUG) {
+            try {
+              console.warn(
+                "[BOT]/request fetch /api/invoice failed:",
+                err?.message || err
+              );
+            } catch {}
+          }
           throw err;
         }
         if (!rest.ok) {
-          const t = await rest.text().catch(() => '');
-          if (DEBUG) { try { console.warn('[BOT]/request invoice non-OK:', rest.status, rest.statusText, t.slice(0, 300)); } catch {} }
-          await reply(`Failed to create invoice: ${rest.status} ${rest.statusText}`);
+          const t = await rest.text().catch(() => "");
+          if (DEBUG) {
+            try {
+              console.warn(
+                "[BOT]/request invoice non-OK:",
+                rest.status,
+                rest.statusText,
+                t.slice(0, 300)
+              );
+            } catch {}
+          }
+          await reply(
+            `Failed to create invoice: ${rest.status} ${rest.statusText}`
+          );
           return NextResponse.json({ ok: true, error: t });
         }
-        const json = await rest.json().catch(() => ({} as any));
-        if (DEBUG) { try { console.log('[BOT]/request invoice OK response keys:', Object.keys(json || {})); } catch {} }
+        const json = await rest.json().catch(() => ({}) as any);
+        if (DEBUG) {
+          try {
+            console.log(
+              "[BOT]/request invoice OK response keys:",
+              Object.keys(json || {})
+            );
+          } catch {}
+        }
         const id = json.requestId || json.requestID || json.id;
         if (!id) {
-          await reply('Invoice created but id missing');
+          await reply("Invoice created but id missing");
           return NextResponse.json({ ok: true });
         }
         const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
@@ -1721,28 +2509,71 @@ export async function POST(req: NextRequest) {
         // Build QR using forwarder prediction (Create2) for improved wallet compatibility
         let ethUri: string | undefined;
         let lastEthWei: bigint | undefined = undefined;
-        let lastNetworkId: string = '1';
+        let lastNetworkId: string = "1";
         let savedInvoiceIndexKey: string | undefined;
         try {
-          const feeAddress = process.env.FEE_ADDRESS || appConfig.feeAddr || undefined;
-          const feePercentage = feeAddress ? bpsToPercentString(process.env.FEE_BPS || '50') : undefined;
-          if (DEBUG) { try { console.log('[BOT]/request fetching pay calldata for id=', id); } catch {} }
-          const payJson = await fetchPayCalldata(id, { feeAddress, feePercentage, apiKey: appConfig.request.apiKey || process.env.REQUEST_API_KEY });
-          if (DEBUG) { try { console.log('[BOT]/request pay transactions:', Array.isArray((payJson as any)?.transactions) ? (payJson as any).transactions.length : 0); } catch {} }
+          const feeAddress =
+            process.env.FEE_ADDRESS || appConfig.feeAddr || undefined;
+          const feePercentage = feeAddress
+            ? bpsToPercentString(process.env.FEE_BPS || "50")
+            : undefined;
+          if (DEBUG) {
+            try {
+              console.log("[BOT]/request fetching pay calldata for id=", id);
+            } catch {}
+          }
+          const payJson = await fetchPayCalldata(id, {
+            feeAddress,
+            feePercentage,
+            apiKey: appConfig.request.apiKey || process.env.REQUEST_API_KEY,
+          });
+          if (DEBUG) {
+            try {
+              console.log(
+                "[BOT]/request pay transactions:",
+                Array.isArray((payJson as any)?.transactions)
+                  ? (payJson as any).transactions.length
+                  : 0
+              );
+            } catch {}
+          }
           const fwd = extractForwarderInputs(payJson);
-          if (DEBUG) { try { console.log('[BOT]/request forwarder inputs:', { proxy: fwd.requestProxy, to: fwd.beneficiary, feeAddress: fwd.feeAddress, feeAmountWei: String(fwd.feeAmountWei), hasAmount: typeof fwd.amountWei === 'bigint' }); } catch {} }
+          if (DEBUG) {
+            try {
+              console.log("[BOT]/request forwarder inputs:", {
+                proxy: fwd.requestProxy,
+                to: fwd.beneficiary,
+                feeAddress: fwd.feeAddress,
+                feeAmountWei: String(fwd.feeAmountWei),
+                hasAmount: typeof fwd.amountWei === "bigint",
+              });
+            } catch {}
+          }
 
           // Compute network id and CreateX config
-          const chainKey = String(appConfig.request.chain || '').toLowerCase();
-          const NETWORK_ID_BY_CHAIN: Record<string, string> = { base: '8453', ethereum: '1', mainnet: '1', sepolia: '11155111' };
-          const networkId = NETWORK_ID_BY_CHAIN[chainKey] || '1';
+          const chainKey = String(appConfig.request.chain || "").toLowerCase();
+          const NETWORK_ID_BY_CHAIN: Record<string, string> = {
+            base: "8453",
+            ethereum: "1",
+            mainnet: "1",
+            sepolia: "11155111",
+          };
+          const networkId = NETWORK_ID_BY_CHAIN[chainKey] || "1";
           lastNetworkId = networkId;
-          lastEthWei = (typeof fwd.amountWei === 'bigint' ? fwd.amountWei : undefined);
-          const createx = (process.env.CREATEX_ADDRESS || process.env.CREATE_X || '').trim() as `0x${string}`;
-          if (!/^0x[0-9a-fA-F]{40}$/.test(createx)) throw new Error('Missing CREATEX_ADDRESS');
+          lastEthWei =
+            typeof fwd.amountWei === "bigint" ? fwd.amountWei : undefined;
+          const createx = (
+            process.env.CREATEX_ADDRESS ||
+            process.env.CREATE_X ||
+            ""
+          ).trim() as `0x${string}`;
+          if (!/^0x[0-9a-fA-F]{40}$/.test(createx))
+            throw new Error("Missing CREATEX_ADDRESS");
 
           // Salt ties deposit address to request id and chain
-          const salt = keccak256(toHex(`DIAL|${id}|${networkId}`)) as `0x${string}`;
+          const salt = keccak256(
+            toHex(`DIAL|${id}|${networkId}`)
+          ) as `0x${string}`;
           const initCode = buildForwarderInitCode({
             requestProxy: fwd.requestProxy,
             beneficiary: fwd.beneficiary,
@@ -1751,9 +2582,26 @@ export async function POST(req: NextRequest) {
             feeAddress: fwd.feeAddress,
             bytecode: (ForwarderArtifact as any)?.bytecode as `0x${string}`,
           });
-          if (DEBUG) { try { console.log('[BOT]/request predict input:', { networkId, createx, salt: salt.slice(0,10)+'…', initCodeLen: initCode.length }); } catch {} }
-          const predicted = predictCreate2AddressCreateX({ deployer: createx, rawSalt: salt, initCode });
-          if (DEBUG) { try { console.log('[BOT]/request predicted address:', predicted); } catch {} }
+          if (DEBUG) {
+            try {
+              console.log("[BOT]/request predict input:", {
+                networkId,
+                createx,
+                salt: salt.slice(0, 10) + "…",
+                initCodeLen: initCode.length,
+              });
+            } catch {}
+          }
+          const predicted = predictCreate2AddressCreateX({
+            deployer: createx,
+            rawSalt: salt,
+            initCode,
+          });
+          if (DEBUG) {
+            try {
+              console.log("[BOT]/request predicted address:", predicted);
+            } catch {}
+          }
           if (predicted && fwd.amountWei && fwd.amountWei > 0n) {
             const decVal = fwd.amountWei.toString(10);
             // Save predict context for webhook
@@ -1764,24 +2612,33 @@ export async function POST(req: NextRequest) {
                 salt,
                 initCode,
               });
-              requestIdByPredictedAddress.set(String(predicted).toLowerCase(), id);
+              requestIdByPredictedAddress.set(
+                String(predicted).toLowerCase(),
+                id
+              );
             } catch {}
             // Persist invoice metadata to S3 for later lookup by predicted address (optional)
             try {
-              const tgUserName: string = (msg?.from?.username || '').toString();
+              const tgUserName: string = (msg?.from?.username || "").toString();
               const lowerPred = String(predicted).toLowerCase();
-              const fileName = `invoice-${lowerPred}-${tgUserName || 'anon'}-${id}.json`;
+              const fileName = `invoice-${lowerPred}-${
+                tgUserName || "anon"
+              }-${id}.json`;
               let s3Key = fileName;
               try {
                 const s3env = await loadS3();
-                if (!s3env) throw new Error('S3 not configured');
+                if (!s3env) throw new Error("S3 not configured");
                 const { PATH_INVOICES } = s3env as any;
                 s3Key = `${PATH_INVOICES}${fileName}`;
               } catch {}
               savedInvoiceIndexKey = s3Key;
               const scanUrl = `https://scan.request.network/request/${id}`;
               const chainIdNum = Number(networkId) || 1;
-              const payUri = buildEthereumUri({ to: String(predicted), valueWeiDec: decVal, chainId: chainIdNum });
+              const payUri = buildEthereumUri({
+                to: String(predicted),
+                valueWeiDec: decVal,
+                chainId: chainIdNum,
+              });
               const record = {
                 requestId: id,
                 networkId,
@@ -1809,57 +2666,128 @@ export async function POST(req: NextRequest) {
               try {
                 const s3env = await loadS3();
                 if (s3env?.writeS3File) {
-                  await (s3env as any).writeS3File(s3Key, { Body: body, ContentType: 'application/json' });
+                  await (s3env as any).writeS3File(s3Key, {
+                    Body: body,
+                    ContentType: "application/json",
+                  });
                 }
               } catch {}
-              if (DEBUG) { try { console.log('[BOT]/request saved invoice json to S3:', s3Key); } catch {} }
+              if (DEBUG) {
+                try {
+                  console.log("[BOT]/request saved invoice json to S3:", s3Key);
+                } catch {}
+              }
             } catch (e) {
-              if (DEBUG) { try { console.warn('[BOT]/request failed to save invoice S3:', (e as any)?.message || e); } catch {} }
+              if (DEBUG) {
+                try {
+                  console.warn(
+                    "[BOT]/request failed to save invoice S3:",
+                    (e as any)?.message || e
+                  );
+                } catch {}
+              }
             }
             // Optional: Alchemy webhook integration removed (no-op if not configured)
-              // Register address activity on Alchemy webhook (create once, then update addresses)
-              try {
-                const alchemyWebhookId = process.env.ALCHEMY_WEBHOOK_ID;
-                if (alchemyWebhookId) {
-                  await updateWebhookAddresses({ webhookId: alchemyWebhookId, add: [predicted as `0x${string}`], remove: [] });
-                  if (DEBUG) {
-                    try { console.log('[BOT]/request alchemy: added address to webhook', { webhookId: alchemyWebhookId, address: predicted }); } catch {}
-                  }
-                } else {
-                  const created = await createAddressActivityWebhook({ addresses: [predicted as `0x${string}`] });
-                  if (DEBUG) {
-                    try { console.log('[BOT]/request alchemy: created webhook', created); } catch {}
-                  }
+            // Register address activity on Alchemy webhook (create once, then update addresses)
+            try {
+              const alchemyWebhookId = process.env.ALCHEMY_WEBHOOK_ID;
+              if (alchemyWebhookId) {
+                await updateWebhookAddresses({
+                  webhookId: alchemyWebhookId,
+                  add: [predicted as `0x${string}`],
+                  remove: [],
+                });
+                if (DEBUG) {
+                  try {
+                    console.log(
+                      "[BOT]/request alchemy: added address to webhook",
+                      { webhookId: alchemyWebhookId, address: predicted }
+                    );
+                  } catch {}
                 }
-              } catch (e) {
-                if (DEBUG) { try { console.warn('[BOT] alchemy webhook setup failed', { error: (e as any)?.message || e }); } catch {} }
+              } else {
+                const created = await createAddressActivityWebhook({
+                  addresses: [predicted as `0x${string}`],
+                });
+                if (DEBUG) {
+                  try {
+                    console.log(
+                      "[BOT]/request alchemy: created webhook",
+                      created
+                    );
+                  } catch {}
+                }
               }
+            } catch (e) {
+              if (DEBUG) {
+                try {
+                  console.warn("[BOT] alchemy webhook setup failed", {
+                    error: (e as any)?.message || e,
+                  });
+                } catch {}
+              }
+            }
             // Action registration temporarily disabled; focusing on alert only
 
             // Build direct ETH URI to pay predicted deposit address
             const chainIdNum = Number(networkId) || 1;
-            ethUri = buildEthereumUri({ to: predicted, valueWeiDec: decVal, chainId: chainIdNum });
-            if (DEBUG && ethUri) { try { console.log('[BOT] built ethUri (predict):', ethUri); } catch {} }
+            ethUri = buildEthereumUri({
+              to: predicted,
+              valueWeiDec: decVal,
+              chainId: chainIdNum,
+            });
+            if (DEBUG && ethUri) {
+              try {
+                console.log("[BOT] built ethUri (predict):", ethUri);
+              } catch {}
+            }
           }
         } catch (e) {
-          if (DEBUG) { try { console.warn('[BOT] forwarder predict failed; fallback to invoice link', (e as any)?.message || e); } catch {} }
+          if (DEBUG) {
+            try {
+              console.warn(
+                "[BOT] forwarder predict failed; fallback to invoice link",
+                (e as any)?.message || e
+              );
+            } catch {}
+          }
         }
-        const { qrUrl, caption, keyboard, payUrl: builtPayUrl } = buildQrForRequest(baseUrl, id, ethUri, amt, note || '');
+        const {
+          qrUrl,
+          caption,
+          keyboard,
+          payUrl: builtPayUrl,
+        } = buildQrForRequest(baseUrl, id, ethUri, amt, note || "");
         // Convert request amount to USD via price API
         let usdAmount = amt;
         try {
           const px = await getEthUsdPrice();
-          if (px && typeof lastEthWei === 'bigint') {
+          if (px && typeof lastEthWei === "bigint") {
             const ethFloat = Number(lastEthWei) / 1e18;
             usdAmount = ethFloat * px;
           }
         } catch {}
         // Build rich caption with USD and ETH pretty amounts
-        const netName = (lastNetworkId === '1' ? 'mainnet' : lastNetworkId === '8453' ? 'base' : lastNetworkId === '11155111' ? 'sepolia' : lastNetworkId);
+        const netName =
+          lastNetworkId === "1"
+            ? "mainnet"
+            : lastNetworkId === "8453"
+              ? "base"
+              : lastNetworkId === "11155111"
+                ? "sepolia"
+                : lastNetworkId;
         const richCaption = (() => {
           try {
-            return formatCaptionRich({ username: (msg?.from?.username || '').toString() || undefined, usdAmount, ethWei: lastEthWei, networkName: netName, note: note || '' });
-          } catch { return caption; }
+            return formatCaptionRich({
+              username: (msg?.from?.username || "").toString() || undefined,
+              usdAmount,
+              ethWei: lastEthWei,
+              networkName: netName,
+              note: note || "",
+            });
+          } catch {
+            return caption;
+          }
         })();
         const sent = await tg.sendPhoto(chatId, qrUrl, richCaption, keyboard);
         const messageId = sent?.result?.message_id as number | undefined;
@@ -1868,7 +2796,9 @@ export async function POST(req: NextRequest) {
             requestContextById.set(id, {
               chatId: Number(chatId),
               messageId: Number(messageId),
-              paidCaption: `✅ PAID — $${amt.toFixed(2)}${note ? ` — ${note}` : ''}`,
+              paidCaption: `✅ PAID — $${amt.toFixed(2)}${
+                note ? ` — ${note}` : ""
+              }`,
               replyMarkup: keyboard,
             });
           } catch {}
@@ -1878,18 +2808,32 @@ export async function POST(req: NextRequest) {
             if (s3env?.writeS3File) {
               const { PATH_INVOICES } = s3env as any;
               const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
-              const idxPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
-              await (s3env as any).writeS3File(idxKey, { Body: idxPayload, ContentType: 'application/json' });
+              const idxPayload = Buffer.from(
+                JSON.stringify({ chatId, messageId, requestId: id }, null, 2)
+              );
+              await (s3env as any).writeS3File(idxKey, {
+                Body: idxPayload,
+                ContentType: "application/json",
+              });
               const byMsgKey = `${PATH_INVOICES}by-message/${chatId}/${messageId}.json`;
-              const byMsgPayload = Buffer.from(JSON.stringify({ chatId, messageId, requestId: id }, null, 2));
-              await (s3env as any).writeS3File(byMsgKey, { Body: byMsgPayload, ContentType: 'application/json' });
+              const byMsgPayload = Buffer.from(
+                JSON.stringify({ chatId, messageId, requestId: id }, null, 2)
+              );
+              await (s3env as any).writeS3File(byMsgKey, {
+                Body: byMsgPayload,
+                ContentType: "application/json",
+              });
             }
           } catch {}
         }
 
-        return NextResponse.json({ ok: true, id, payUrl: builtPayUrl || invUrl });
+        return NextResponse.json({
+          ok: true,
+          id,
+          payUrl: builtPayUrl || invUrl,
+        });
       } catch (err: any) {
-        await reply(`Error creating request: ${err?.message || 'unknown'}`);
+        await reply(`Error creating request: ${err?.message || "unknown"}`);
         return NextResponse.json({ ok: false });
       }
     }
@@ -1898,48 +2842,61 @@ export async function POST(req: NextRequest) {
     if (/^\/pay\b/.test(text)) {
       const parts = text.split(/\s+/);
       const to = parts[1];
-      const amt = Number(parts[2] || '0');
-      if (!to || !/^0x[0-9a-fA-F]{40}$/.test(to) || !Number.isFinite(amt) || amt <= 0) {
-        await reply('Usage: /pay <toAddress> <amount>');
+      const amt = Number(parts[2] || "0");
+      if (
+        !to ||
+        !/^0x[0-9a-fA-F]{40}$/.test(to) ||
+        !Number.isFinite(amt) ||
+        amt <= 0
+      ) {
+        await reply("Usage: /pay <toAddress> <amount>");
         return NextResponse.json({ ok: true });
       }
 
       // Find the Privy user by Telegram user id and get their wallet id
       const privy = await getPrivyClient();
       if (!privy) {
-        await reply('Server wallet not configured.');
+        await reply("Server wallet not configured.");
         return NextResponse.json({ ok: true });
       }
-      const user = await privy.users().getByTelegramUserID({ telegram_user_id: tgUserId });
-      const wallet = user.linked_accounts.find((a: any) => a.type === 'wallet' && 'id' in a);
+      const user = await privy
+        .users()
+        .getByTelegramUserID({ telegram_user_id: tgUserId });
+      const wallet = user.linked_accounts.find(
+        (a: any) => a.type === "wallet" && "id" in a
+      );
       const walletId = (wallet as any)?.id;
       if (!walletId) {
-        await reply('No wallet linked. Open the app and sign in first.');
+        await reply("No wallet linked. Open the app and sign in first.");
         return NextResponse.json({ ok: true });
       }
 
       // Send a native transfer on Base (eip155:8453) @or USDC transfer if desired
-      await privy.wallets().ethereum().sendTransaction(walletId, {
-        caip2: 'eip155:8453',
-        params: {
-          transaction: {
-            to,
-            value: '0x' + BigInt(Math.round(amt * 1e18)).toString(16),
+      await privy
+        .wallets()
+        .ethereum()
+        .sendTransaction(walletId, {
+          caip2: "eip155:8453",
+          params: {
+            transaction: {
+              to,
+              value: "0x" + BigInt(Math.round(amt * 1e18)).toString(16),
+            },
           },
-        },
-      });
+        });
 
       await reply(`Sent ${amt} (native) to ${to}`);
       return NextResponse.json({ ok: true });
     }
 
-    if (chatType === 'private' && isCommand) {
-      await reply('Unknown command. Try /pay or /request');
+    if (chatType === "private" && isCommand) {
+      await reply("Unknown command. Try /pay or /request");
     }
     return NextResponse.json({ ok: true });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || 'error' }, { status: 200 });
+    return NextResponse.json(
+      { ok: false, error: e?.message || "error" },
+      { status: 200 }
+    );
   }
 }
-
-
