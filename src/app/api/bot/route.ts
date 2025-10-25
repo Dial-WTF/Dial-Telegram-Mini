@@ -2365,8 +2365,17 @@ export async function POST(req: NextRequest) {
 
     // /request <amount> [note] [destination]
     if (/^\/request\b/i.test(text)) {
-      // implement Command ctx compatible object with platform: "telegram"
-      // TODO
+      // Construct bot-kit-compatible ctx object (before anything else)
+      const ctx = {
+        platform: "telegram",
+        userId: String(msg?.from?.id),
+        chatId: String(msg?.chat?.id),
+        text: msg?.text || "",
+        baseUrl: process.env.PUBLIC_BASE_URL || req.nextUrl.origin,
+        locale: msg?.from?.language_code,
+        meta: { msg, req, chatType: msg?.chat?.type },
+        caps: {}, // TODO: fill in from real adapter
+      };
 
       // Parse request command
       const parsed = parseRequest(text, process.env.BOT_USERNAME);
@@ -2841,13 +2850,17 @@ export async function POST(req: NextRequest) {
         // Build bot response (unified payload for send/response)
         const botResponse = {
           body: richCaption, // fallback for all platforms
-          images: qrUrl ? [{ url: qrUrl, alt: "Pay QR", caption: richCaption }] : undefined,
-          buttons: keyboard ? keyboard.inline_keyboard?.[0]?.map((btn: any) => ({
-            id: btn.text,
-            label: btn.text,
-            ...(btn.web_app ? { webApp: btn.web_app } : {}),
-            ...(btn.url ? { url: btn.url } : {}),
-          })) : undefined,
+          images: qrUrl
+            ? [{ url: qrUrl, alt: "Pay QR", caption: richCaption }]
+            : undefined,
+          buttons: keyboard
+            ? keyboard.inline_keyboard?.[0]?.map((btn: any) => ({
+                id: btn.text,
+                label: btn.text,
+                ...(btn.web_app ? { webApp: btn.web_app } : {}),
+                ...(btn.url ? { url: btn.url } : {}),
+              }))
+            : undefined,
         };
         // Use ONLY botResponse for the final send/response logic below (tg.sendPhoto, etc)
 
