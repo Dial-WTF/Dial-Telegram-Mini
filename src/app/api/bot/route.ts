@@ -2400,31 +2400,31 @@ export async function POST(req: NextRequest) {
           if (resolved) payee = resolved;
         }
         if (!payee) {
-          try {
-            const privy = await getPrivyClient();
-            if (privy) {
-              const user = await privy
-                .users()
-                .getByTelegramUserID({ telegram_user_id: ctx.userId });
-              const w = (user.linked_accounts || []).find(
-                (a: any) =>
-                  a.type === "wallet" && typeof (a as any).address === "string"
-              );
-              const addr = (w as any)?.address as string | undefined;
-              if (addr && isValidEthereumAddress(addr)) payee = addr;
-              else if ((w as any)?.id) {
-                try {
-                  const walletId = (w as any).id as string;
-                  const details = await (privy as any)
-                    .wallets()
-                    .ethereum()
-                    .get(walletId);
-                  const a = details?.address as string | undefined;
-                  if (a && isValidEthereumAddress(a)) payee = a;
-                } catch {}
-              }
-            }
-          } catch {}
+          // try {
+          //   const privy = await getPrivyClient();
+          //   if (privy) {
+          //     const user = await privy
+          //       .users()
+          //       .getByTelegramUserID({ telegram_user_id: ctx.userId });
+          //     const w = (user.linked_accounts || []).find(
+          //       (a: any) =>
+          //         a.type === "wallet" && typeof (a as any).address === "string"
+          //     );
+          //     const addr = (w as any)?.address as string | undefined;
+          //     if (addr && isValidEthereumAddress(addr)) payee = addr;
+          //     else if ((w as any)?.id) {
+          //       try {
+          //         const walletId = (w as any).id as string;
+          //         const details = await (privy as any)
+          //           .wallets()
+          //           .ethereum()
+          //           .get(walletId);
+          //         const a = details?.address as string | undefined;
+          //         if (a && isValidEthereumAddress(a)) payee = a;
+          //       } catch {}
+          //     }
+          //   }
+          // } catch {}
         }
         if (!payee)
           payee =
