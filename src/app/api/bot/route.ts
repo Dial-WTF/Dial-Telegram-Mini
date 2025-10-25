@@ -2667,7 +2667,7 @@ export async function POST(req: NextRequest) {
                 ethereumUri: payUri,
                 requestScanUrl: scanUrl,
                 telegram: {
-                  chatId,
+                  chatId: chatId,
                   chatType,
                   userId: tgUserId,
                   username: tgUserName || undefined,
@@ -2832,18 +2832,6 @@ export async function POST(req: NextRequest) {
             }
           } catch {}
         }
-
-        // Fully construct ctx object for bot-kit compatibility
-        const ctx = {
-          platform: "telegram",
-          userId: String(msg?.from?.id),
-          chatId: String(msg?.chat?.id),
-          text: msg?.text || "",
-          baseUrl: process.env.PUBLIC_BASE_URL || req.nextUrl.origin,
-          locale: msg?.from?.language_code,
-          meta: { msg, req, chatType: msg?.chat?.type },
-          caps: {}, // TODO: add real adapter caps
-        };
 
         // Build bot response (unified payload for send/response)
         const botResponse = {
