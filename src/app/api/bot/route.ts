@@ -2516,7 +2516,7 @@ export async function POST(req: NextRequest) {
           await reply("Invoice created but id missing");
           return NextResponse.json({ ok: true });
         }
-        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const baseUrl = ctx.baseUrl;
         const invUrl = `${baseUrl}/pay/${id}`;
 
         // Build QR using forwarder prediction (Create2) for improved wallet compatibility
@@ -2632,7 +2632,7 @@ export async function POST(req: NextRequest) {
             } catch {}
             // Persist invoice metadata to S3 for later lookup by predicted address (optional)
             try {
-              const tgUserName: string = (msg?.from?.username || "").toString();
+              const tgUserName: string = (ctx.meta.msg?.from?.username || "").toString();
               const lowerPred = String(predicted).toLowerCase();
               const fileName = `invoice-${lowerPred}-${
                 tgUserName || "anon"
@@ -2667,11 +2667,11 @@ export async function POST(req: NextRequest) {
                 ethereumUri: payUri,
                 requestScanUrl: scanUrl,
                 telegram: {
-                  chatId: chatId,
-                  chatType,
-                  userId: tgUserId,
+                  chatId: ctx.chatId,
+                  chatType: ctx.meta.chatType,
+                  userId: ctx.userId,
                   username: tgUserName || undefined,
-                  commandText: text,
+                  commandText: ctx.text,
                 },
                 createdAt: new Date().toISOString(),
               } as const;
@@ -2786,7 +2786,7 @@ export async function POST(req: NextRequest) {
         const richCaption = (() => {
           try {
             return formatCaptionRich({
-              username: (msg?.from?.username || "").toString() || undefined,
+              username: (ctx.meta.msg?.from?.username || "").toString() || undefined,
               ethWei,
               networkName: netName,
               note: note || "",
@@ -2795,12 +2795,12 @@ export async function POST(req: NextRequest) {
             return caption;
           }
         })();
-        const sent = await tg.sendPhoto(chatId, qrUrl, richCaption, keyboard);
+        const sent = await tg.sendPhoto(ctx.chatId, qrUrl, richCaption, keyboard);
         const messageId = sent?.result?.message_id as number | undefined;
         if (messageId) {
           try {
             requestContextById.set(id, {
-              chatId: Number(chatId),
+              chatId: Number(ctx.chatId),
               messageId: Number(messageId),
               paidCaption: `✅ PAID — ${formatEthTrimmed(ethWei)} ETH${
                 note ? ` — ${note}` : ""
@@ -2815,15 +2815,15 @@ export async function POST(req: NextRequest) {
               const { PATH_INVOICES } = s3env as any;
               const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
               const idxPayload = Buffer.from(
-                JSON.stringify({ chatId, messageId, requestId: id }, null, 2)
+                JSON.stringify({ chatId: ctx.chatId, messageId, requestId: id }, null, 2)
               );
               await (s3env as any).writeS3File(idxKey, {
                 Body: idxPayload,
                 ContentType: "application/json",
               });
-              const byMsgKey = `${PATH_INVOICES}by-message/${chatId}/${messageId}.json`;
+              const byMsgKey = `${PATH_INVOICES}by-message/${ctx.chatId}/${messageId}.json`;
               const byMsgPayload = Buffer.from(
-                JSON.stringify({ chatId, messageId, requestId: id }, null, 2)
+                JSON.stringify({ chatId: ctx.chatId, messageId, requestId: id }, null, 2)
               );
               await (s3env as any).writeS3File(byMsgKey, {
                 Body: byMsgPayload,
@@ -2833,22 +2833,6 @@ export async function POST(req: NextRequest) {
           } catch {}
         }
 
-        // Build bot response (unified payload for send/response)
-        const botResponse = {
-          body: richCaption, // fallback for all platforms
-          images: qrUrl
-            ? [{ url: qrUrl, alt: "Pay QR", caption: richCaption }]
-            : undefined,
-          buttons: keyboard
-            ? keyboard.inline_keyboard?.[0]?.map((btn: any) => ({
-                id: btn.text,
-                label: btn.text,
-                ...(btn.web_app ? { webApp: btn.web_app } : {}),
-                ...(btn.url ? { url: btn.url } : {}),
-              }))
-            : undefined,
-        };
-        // Use ONLY botResponse for the final send/response logic below (tg.sendPhoto, etc)
 
         return NextResponse.json({
           ok: true,
