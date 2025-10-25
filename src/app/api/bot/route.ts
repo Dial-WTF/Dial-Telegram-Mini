@@ -2376,24 +2376,22 @@ export async function POST(req: NextRequest) {
         meta: { msg, req, chatType: msg?.chat?.type },
         caps: {}, // TODO: fill in from real adapter
       };
-
       // Parse request command
-      const parsed = parseRequest(text, process.env.BOT_USERNAME);
+      const parsed = parseRequest(ctx.text, process.env.BOT_USERNAME);
       const amt = parsed.amount as number;
       const note = parsed.memo;
       const explicitDest = parsed.payeeCandidate;
       if (!Number.isFinite(amt) || amt <= 0) {
         if (DEBUG) {
-          await reply(`dbg: parse failed. raw="${text}"`);
+          await reply(`dbg: parse failed. raw="${ctx.text}"`);
         }
         await reply(
           "Usage: /request <eth_amount> [note] [destination]\n\nExample: /request 0.1 coffee vitalik.eth"
         );
         return NextResponse.json({ ok: true });
       }
-
       try {
-        const apiBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const apiBase = ctx.baseUrl;
         // Resolve payee: explicit destination > linked wallet > env fallback
         let payee: string | undefined;
         if (explicitDest) {
@@ -2406,7 +2404,7 @@ export async function POST(req: NextRequest) {
             if (privy) {
               const user = await privy
                 .users()
-                .getByTelegramUserID({ telegram_user_id: tgUserId });
+                .getByTelegramUserID({ telegram_user_id: ctx.userId });
               const w = (user.linked_accounts || []).find(
                 (a: any) =>
                   a.type === "wallet" && typeof (a as any).address === "string"
@@ -2433,17 +2431,17 @@ export async function POST(req: NextRequest) {
             appConfig.payeeAddr ||
             undefined;
         if (!payee) {
-          const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+          const baseUrl = ctx.baseUrl;
           const keyboard = {
             inline_keyboard: [
               [{ text: "Open app to link wallet", web_app: { url: baseUrl } }],
             ],
           } as any;
-          pendingAddressByUser.set(tgUserId, { ethAmount: amt, note });
+          pendingAddressByUser.set(ctx.userId, { ethAmount: amt, note });
           const combinedText =
             "No wallet linked. Open the app and sign in first, then retry /request.\n\nAlternatively, reply to this message with your receiving address or ENS.";
           await tgCall("sendMessage", {
-            chat_id: chatId,
+            chat_id: ctx.chatId,
             text: combinedText,
             reply_markup: keyboard,
           });
