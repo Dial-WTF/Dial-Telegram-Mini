@@ -33,6 +33,7 @@ import {
   predictContextByAddress,
   requestIdByPredictedAddress,
 } from "#/lib/mem";
+import type { BotResponse } from "@bot/ui-kit";
 // Optional dependency: Privy disabled in this build
 async function getPrivyClient() {
   return null as any;
@@ -2365,22 +2366,33 @@ export async function POST(req: NextRequest) {
 
     // /request <amount> [note] [destination]
     if (/^\/request\b/i.test(text)) {
-      const parsed = parseRequest(text, process.env.BOT_USERNAME);
+      // Construct bot-kit-compatible ctx object (before anything else)
+      const ctx = {
+        platform: "telegram",
+        userId: String(msg?.from?.id),
+        chatId: String(msg?.chat?.id),
+        text: msg?.text || "",
+        baseUrl: process.env.PUBLIC_BASE_URL || req.nextUrl.origin,
+        locale: msg?.from?.language_code,
+        meta: { msg, req, chatType: msg?.chat?.type },
+        caps: {}, // TODO: fill in from real adapter
+      };
+      // Parse request command
+      const parsed = parseRequest(ctx.text, process.env.BOT_USERNAME);
       const amt = parsed.amount as number;
       const note = parsed.memo;
       const explicitDest = parsed.payeeCandidate;
       if (!Number.isFinite(amt) || amt <= 0) {
         if (DEBUG) {
-          await reply(`dbg: parse failed. raw="${text}"`);
+          await reply(`dbg: parse failed. raw="${ctx.text}"`);
         }
         await reply(
           "Usage: /request <eth_amount> [note] [destination]\n\nExample: /request 0.1 coffee vitalik.eth"
         );
         return NextResponse.json({ ok: true });
       }
-
       try {
-        const apiBase = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const apiBase = ctx.baseUrl;
         // Resolve payee: explicit destination > linked wallet > env fallback
         let payee: string | undefined;
         if (explicitDest) {
@@ -2393,7 +2405,7 @@ export async function POST(req: NextRequest) {
             if (privy) {
               const user = await privy
                 .users()
-                .getByTelegramUserID({ telegram_user_id: tgUserId });
+                .getByTelegramUserID({ telegram_user_id: ctx.userId });
               const w = (user.linked_accounts || []).find(
                 (a: any) =>
                   a.type === "wallet" && typeof (a as any).address === "string"
@@ -2420,17 +2432,20 @@ export async function POST(req: NextRequest) {
             appConfig.payeeAddr ||
             undefined;
         if (!payee) {
-          const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+          const baseUrl = ctx.baseUrl;
           const keyboard = {
             inline_keyboard: [
               [{ text: "Open app to link wallet", web_app: { url: baseUrl } }],
             ],
           } as any;
-          pendingAddressByUser.set(tgUserId, { ethAmount: amt, note });
+          pendingAddressByUser.set(Number(ctx.userId), {
+            ethAmount: amt,
+            note,
+          });
           const combinedText =
             "No wallet linked. Open the app and sign in first, then retry /request.\n\nAlternatively, reply to this message with your receiving address or ENS.";
           await tgCall("sendMessage", {
-            chat_id: chatId,
+            chat_id: ctx.chatId,
             text: combinedText,
             reply_markup: keyboard,
           });
@@ -2505,7 +2520,7 @@ export async function POST(req: NextRequest) {
           await reply("Invoice created but id missing");
           return NextResponse.json({ ok: true });
         }
-        const baseUrl = process.env.PUBLIC_BASE_URL || req.nextUrl.origin;
+        const baseUrl = ctx.baseUrl;
         const invUrl = `${baseUrl}/pay/${id}`;
 
         // Build QR using forwarder prediction (Create2) for improved wallet compatibility
@@ -2621,7 +2636,9 @@ export async function POST(req: NextRequest) {
             } catch {}
             // Persist invoice metadata to S3 for later lookup by predicted address (optional)
             try {
-              const tgUserName: string = (msg?.from?.username || "").toString();
+              const tgUserName: string = (
+                ctx.meta.msg?.from?.username || ""
+              ).toString();
               const lowerPred = String(predicted).toLowerCase();
               const fileName = `invoice-${lowerPred}-${
                 tgUserName || "anon"
@@ -2656,11 +2673,11 @@ export async function POST(req: NextRequest) {
                 ethereumUri: payUri,
                 requestScanUrl: scanUrl,
                 telegram: {
-                  chatId,
-                  chatType,
-                  userId: tgUserId,
+                  chatId: ctx.chatId,
+                  chatType: ctx.meta.chatType,
+                  userId: ctx.userId,
                   username: tgUserName || undefined,
-                  commandText: text,
+                  commandText: ctx.text,
                 },
                 createdAt: new Date().toISOString(),
               } as const;
@@ -2775,7 +2792,8 @@ export async function POST(req: NextRequest) {
         const richCaption = (() => {
           try {
             return formatCaptionRich({
-              username: (msg?.from?.username || "").toString() || undefined,
+              username:
+                (ctx.meta.msg?.from?.username || "").toString() || undefined,
               ethWei,
               networkName: netName,
               note: note || "",
@@ -2784,12 +2802,61 @@ export async function POST(req: NextRequest) {
             return caption;
           }
         })();
-        const sent = await tg.sendPhoto(chatId, qrUrl, richCaption, keyboard);
+
+        // Build BotResponse object (bot-kit compatible)
+        const botResponse: BotResponse = {
+          body: richCaption,
+          formatted_body: richCaption,
+          format: "markdown" as const,
+          images: [
+            {
+              url: qrUrl,
+              caption: richCaption,
+              captionMarkdown: true,
+            },
+          ],
+          buttons: keyboard.inline_keyboard.flat().map((btn: any) => {
+            if ("web_app" in btn) {
+              return {
+                id: btn.text,
+                label: btn.text,
+                webApp: { url: btn.web_app.url },
+              };
+            }
+            if ("url" in btn) {
+              return {
+                id: btn.text,
+                label: btn.text,
+                url: btn.url,
+              };
+            }
+            return { id: btn.text, label: btn.text };
+          }),
+          extensions: {
+            "io.telegram": {
+              parse_mode: "Markdown" as const,
+              reply_markup: keyboard,
+            },
+          },
+        };
+
+        // Extract from botResponse for sending
+        const imageToSend = botResponse.images?.[0];
+        const captionToSend = imageToSend?.caption || botResponse.body || "";
+        const keyboardToSend =
+          botResponse.extensions?.["io.telegram"]?.reply_markup || keyboard;
+
+        const sent = await tg.sendPhoto(
+          ctx.chatId,
+          imageToSend?.url || qrUrl,
+          captionToSend,
+          keyboardToSend
+        );
         const messageId = sent?.result?.message_id as number | undefined;
         if (messageId) {
           try {
             requestContextById.set(id, {
-              chatId: Number(chatId),
+              chatId: Number(ctx.chatId),
               messageId: Number(messageId),
               paidCaption: `✅ PAID — ${formatEthTrimmed(ethWei)} ETH${
                 note ? ` — ${note}` : ""
@@ -2804,15 +2871,23 @@ export async function POST(req: NextRequest) {
               const { PATH_INVOICES } = s3env as any;
               const idxKey = `${PATH_INVOICES}by-request/${id}.json`;
               const idxPayload = Buffer.from(
-                JSON.stringify({ chatId, messageId, requestId: id }, null, 2)
+                JSON.stringify(
+                  { chatId: ctx.chatId, messageId, requestId: id },
+                  null,
+                  2
+                )
               );
               await (s3env as any).writeS3File(idxKey, {
                 Body: idxPayload,
                 ContentType: "application/json",
               });
-              const byMsgKey = `${PATH_INVOICES}by-message/${chatId}/${messageId}.json`;
+              const byMsgKey = `${PATH_INVOICES}by-message/${ctx.chatId}/${messageId}.json`;
               const byMsgPayload = Buffer.from(
-                JSON.stringify({ chatId, messageId, requestId: id }, null, 2)
+                JSON.stringify(
+                  { chatId: ctx.chatId, messageId, requestId: id },
+                  null,
+                  2
+                )
               );
               await (s3env as any).writeS3File(byMsgKey, {
                 Body: byMsgPayload,
