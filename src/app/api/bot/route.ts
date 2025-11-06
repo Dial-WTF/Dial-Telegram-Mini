@@ -2387,7 +2387,7 @@ export async function POST(req: NextRequest) {
           await reply(`dbg: parse failed. raw="${ctx.text}"`);
         }
         await reply(
-          "Usage: /request <eth_amount> [note] [destination]\n\nExample: /request 0.1 coffee vitalik.eth"
+          `Usage: /request <eth_amount> [note] [destination]\n\nExample: /request 0.1 coffee vitalik.eth`
         );
         return NextResponse.json({ ok: true });
       }
