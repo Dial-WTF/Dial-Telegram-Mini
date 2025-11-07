@@ -978,6 +978,12 @@ export async function POST(req: NextRequest) {
         const { chat } = await import("@/lib/ai-inference");
         const { createHash } = await import("crypto");
 
+        // Send "thinking" message for explicit /ask command (both DMs and groups)
+        await tgCall("sendMessage", {
+          chat_id: chatId,
+          text: "Okay — let me think on that…",
+        });
+
         // Append user message to session regardless of routing path
         const session = getChatSession(tgUserId, chatId, ""); // placeholder session, will set model below
         addMessageToSession(tgUserId, chatId, {

@@ -172,7 +172,7 @@ export async function GET(req: NextRequest) {
             fill="black" fill-opacity="0.75"/>
         </svg>`;
 
-      // Resolve logo source: 
+      // Resolve logo source:
       // - if starts with http(s), fetch and buffer
       // - if starts with '/', load from public/<path>
       // - else, resolve relative to process.cwd()
